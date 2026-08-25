@@ -23,6 +23,7 @@ import claude_runner
 import config
 import screen
 import sysctl
+import ui
 import usage
 
 # --------------------------------------------------------------------------- state
@@ -60,6 +61,14 @@ class ChannelState:
 
 
 STATES: dict[int, ChannelState] = {}
+
+UI = ui.DesktopUI()
+
+# Set once the client is up, so the tray and HUD threads can hop onto the
+# asyncio loop. ACTIVE_CTX is whichever channel currently owns a Claude turn —
+# the tray's "Kill current task" and the HUD's Kill button act on it.
+LOOP: asyncio.AbstractEventLoop | None = None
+ACTIVE_CTX: "Ctx | None" = None
 
 
 def state_for(channel_id: int) -> ChannelState:
@@ -280,6 +289,18 @@ async def cmd_claude(ctx: Ctx) -> None:
 
 
 async def _drive_claude(ctx: Ctx, prompt: str) -> None:
+    """Own the desktop UI for the length of one turn, then always release it."""
+    global ACTIVE_CTX
+    ACTIVE_CTX = ctx
+    UI.task_started(Path(ctx.state.cwd).name or ctx.state.cwd)
+    try:
+        await _run_claude_turn(ctx, prompt)
+    finally:
+        ACTIVE_CTX = None
+        UI.task_finished("idle")
+
+
+async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
     session = ctx.state.session
     session.cwd = ctx.state.cwd
     resuming = bool(session.session_id)
@@ -302,13 +323,16 @@ async def _drive_claude(ctx: Ctx, prompt: str) -> None:
             save_sessions()
         elif kind == "thinking":
             status.add("💭 thinking…")
+            UI.task_update("thinking…")
         elif kind == "text":
             texts.append(event["text"])
             preview = " ".join(event["text"].split())[:140]
             status.add(f"💬 {preview}")
+            UI.task_update(preview)
         elif kind == "tool":
             summary = event.get("summary", "")
             status.add(f"🔧 **{event['name']}** `{summary}`" if summary else f"🔧 **{event['name']}**")
+            UI.task_update(f"{event['name']} {summary}".strip())
         elif kind == "tool_result":
             if event.get("is_error"):
                 status.add(f"⚠️ error: `{event.get('preview', '')}`")
@@ -885,6 +909,9 @@ client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready() -> None:
+    global LOOP
+    LOOP = asyncio.get_running_loop()
+    UI.task_finished("idle")
     print(f"[pccontrol] logged in as {client.user} (id {client.user.id})")
     print(f"[pccontrol] owner: {config.OWNER_ID} · prefix: {config.PREFIX}")
     print(f"[pccontrol] default working directory: {config.DEFAULT_WORKDIR}")
@@ -945,6 +972,37 @@ async def on_message(message: discord.Message) -> None:
         await send_long(message.channel, detail, lang="py", filename="traceback.txt")
 
 
+async def _kill_active(reason: str) -> None:
+    """Stop the running Claude turn, whichever channel started it."""
+    ctx = ACTIVE_CTX
+    if ctx is None or ctx.state.claude_task is None or ctx.state.claude_task.done():
+        return
+    ctx.state.claude_task.cancel()
+    await ctx.state.session.cancel()
+    try:
+        await ctx.send(f"🛑 Killed from {reason}.")
+    except discord.HTTPException:
+        pass
+
+
+async def _shutdown() -> None:
+    await _kill_active("the desktop")
+    save_sessions()
+    UI.stop()
+    await client.close()
+
+
+def _from_ui(coro_factory) -> None:
+    """Hop from a UI thread onto the asyncio loop; fall back to a hard exit."""
+    loop = LOOP
+    if loop is not None and loop.is_running():
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(coro_factory()))
+    else:
+        # Not connected yet — nothing to unwind gracefully.
+        UI.stop()
+        os._exit(0)
+
+
 def main() -> None:
     problems = config.validate()
     if problems:
@@ -958,7 +1016,22 @@ def main() -> None:
     except claude_runner.ClaudeNotFound as exc:
         print(f"Warning: {exc}\nEverything except Claude commands will still work.\n")
 
-    client.run(config.TOKEN, log_handler=None)
+    # The bot is remote code execution on this machine; it must never run
+    # without a visible way to see and stop it. No tray, no bot.
+    try:
+        UI.start(
+            on_quit=lambda: _from_ui(_shutdown),
+            on_kill=lambda: _from_ui(lambda: _kill_active("the desktop")),
+        )
+    except ui.TrayUnavailable as exc:
+        print(f"Refusing to start without a tray icon: {exc}")
+        print("Install the tray dependency with: python -m pip install -r requirements.txt")
+        sys.exit(1)
+
+    try:
+        client.run(config.TOKEN, log_handler=None)
+    finally:
+        UI.stop()
 
 
 if __name__ == "__main__":

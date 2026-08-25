@@ -186,6 +186,32 @@ All screen capture is limited to the primary monitor — secondary displays are 
 
 ---
 
+## While it's running
+
+The bot is remote code execution on your machine, so it refuses to run
+invisibly. Two pieces of local UI make that concrete.
+
+**Tray icon.** Present the whole time the bot is up — blurple when idle, amber
+while a prompt is running, with the current state in the tooltip. Right-click
+gives you **Kill current task** and **Quit**. If the tray can't be created the
+bot exits instead of starting; there is no configuration flag to turn this off,
+because a headless copy of this bot is exactly the thing you don't want running.
+
+> Windows hides new tray icons in the overflow (`^`) by default. Drag it onto
+> the taskbar once, or **Settings → Personalisation → Taskbar → Other system
+> tray icons**, so it's actually visible.
+
+**Task HUD.** While a prompt runs, a small panel appears in the bottom-right
+corner showing the tool call in flight — the same stream you see in Discord. It
+has one button, **Kill**, which cancels the turn and kills the `claude` process
+immediately, the same as `!cancel` but without needing your phone. It hides
+itself the moment the turn ends.
+
+Both act on whichever channel currently owns a turn, so the Kill button always
+targets the thing you can see running.
+
+---
+
 ## Browser control
 
 Optional. Gives Claude a real Chrome it can drive — navigate, read the DOM,
@@ -230,6 +256,28 @@ look through my cart on <site> and tell me what's in it
 
 Claude opens the page in that profile, reads it, and answers. You'll see the
 tool calls stream past as `🔧 mcp__chrome-devtools__navigate_page`.
+
+### Using your everyday logins
+
+You cannot point this at your live main profile. Chrome ignores remote debugging
+on the default `--user-data-dir` outright, and that is not a flag you can turn
+off — it's the fix for a real cookie-theft technique.
+
+The supported way to carry your logins across is **Chrome Sync**: open
+`!browser`, sign into Chrome itself with your Google account, and your saved
+passwords, autofill and bookmarks land in the automation profile. Cookies are
+not synced, so you still sign into each site once — but the password is filled
+in for you, so it's a couple of clicks rather than a lookup.
+
+Do that first sign-in yourself, through `!browser`. Google and most large sites
+detect automation-controlled browsers and refuse to complete a login in one, so
+the reliable pattern is: **you** authenticate once, then Claude reuses the
+session for as long as it lasts.
+
+Copying your real profile directory into the automation path is the other thing
+people try. It sometimes works, it puts a second copy of every cookie you own on
+disk, and it breaks whenever Chrome rotates its encryption scheme. Not
+recommended.
 
 > **What this changes about the trust model:** any site signed into that profile
 > is readable by any prompt you send. Sign in only to what you actually want
@@ -292,6 +340,7 @@ Worth knowing:
 | `claude_runner.py` | Claude Code CLI subprocess + `stream-json` parsing. |
 | `usage.py` | Plan rate limits (OAuth endpoint) + local token accounting. |
 | `screen.py` | Screenshots, GIF recording, webcam. |
+| `ui.py` | Tray icon and the live task HUD. |
 | `sysctl.py` | Mouse/keyboard, processes, clipboard, volume, power, windows. |
 | `config.py` | `.env` loading, MCP config discovery. |
 | `mcp.json.example` | Template for the Chrome MCP server. Copy to `mcp.json`. |
