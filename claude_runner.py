@@ -103,6 +103,7 @@ class ClaudeSession:
         ]
         if config.CLAUDE_PERMISSION_MODE == "bypassPermissions":
             args.append("--dangerously-skip-permissions")
+        args.append("--chrome" if config.CLAUDE_CHROME else "--no-chrome")
         if config.MCP_CONFIG:
             args += ["--mcp-config", config.MCP_CONFIG]
         if config.CLAUDE_MODEL:

@@ -45,6 +45,12 @@ CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermiss
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()
 CLAUDE_TIMEOUT = _int("CLAUDE_TIMEOUT", 1800)
 
+# "Claude in Chrome": the CLI talks to the Claude Code browser extension over
+# native messaging, so Claude drives the Chrome you already use, with the
+# sessions you are already signed into. Needs the extension installed and
+# Chrome running; harmless if not, you just get no browser tools.
+CLAUDE_CHROME = _bool("CLAUDE_CHROME", True)
+
 # Extra tools handed to Claude via MCP — browser control lives here. Defaults to
 # mcp.json beside this file when it exists. A path that does not exist is
 # ignored rather than fatal, so the bot still runs with plain Claude.

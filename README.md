@@ -174,7 +174,7 @@ All screen capture is limited to the primary monitor — secondary displays are 
 | `!procs [filter]` · `!kill <pid\|name> [force]` | Process list and termination. |
 | `!windows` · `!focus <title>` | List windows / bring one to the front. |
 | `!open <app\|file\|url>` | Open anything the way Explorer would. |
-| `!browser [url]` | Open Chrome on the profile Claude browses with, to sign into sites (alias `!chrome`). |
+| `!browser [url]` | Open Chrome on the isolated automation profile, if you use one (alias `!chrome`). |
 | `!clip [text]` | Read or set the clipboard. |
 | `!vol <0-100\|up\|down\|mute>` | System volume. |
 
@@ -214,76 +214,57 @@ targets the thing you can see running.
 
 ## Browser control
 
-Optional. Gives Claude a real Chrome it can drive — navigate, read the DOM,
-click, fill forms — so prompts like *"check my cart on the site I'm signed into
-and tell me what's in it"* work. It reads the live page, not a screenshot, so
-it's accurate and cheap compared to clicking around with `!click`.
-
-This runs on a **dedicated Chrome profile**, not your everyday one. That isn't a
-style choice: since Chrome 136, `--remote-debugging-port` is ignored on the
-default profile, because a debuggable browser is a cookie-theft vector. A
-separate profile gets its own encryption key. The upside is that Claude only
-ever sees the sites you deliberately signed into on that profile.
-
-### 1. Point the config at a profile directory
-
-```powershell
-copy mcp.json.example mcp.json
-notepad mcp.json     # set --user-data-dir to a path you own
-```
-
-The directory is created on first use. Requires Node.js — `npx` fetches
-[`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)
-on demand. Restart the bot; it passes the file to Claude with `--mcp-config`.
-
-### 2. Sign in, once
+On by default. Claude drives **the Chrome you already use**, with the sessions
+you are already signed into, so prompts like this just work:
 
 ```
-!browser https://example.com
+check my aliexpress cart and tell me what's in it
 ```
 
-That opens Chrome on the automation profile. Log in normally and the cookies
-persist there for good. You can do this remotely: `!browser`, then `!ss` to see
-the screen and `!click` / `!type` to work the login form over Discord. **Close
-the window when you're done** — Chrome and the MCP server can't share one
-profile directory at the same time.
+No per-site setup, no separate profile, no logging in again. If you're signed
+into a site in Chrome, Claude can use it.
 
-### 3. Ask for it
+This is Claude Code's **Claude in Chrome** integration. The CLI talks over
+native messaging to a Chrome extension running inside your normal browser, so
+there is no remote-debugging port and nothing is copied out of your profile —
+the extension is simply already inside it. The bot passes `--chrome` on every
+turn; set `CLAUDE_CHROME=false` to turn it off.
 
-```
-look through my cart on <site> and tell me what's in it
-```
+### Setup
 
-Claude opens the page in that profile, reads it, and answers. You'll see the
-tool calls stream past as `🔧 mcp__chrome-devtools__navigate_page`.
+Run `claude` in a terminal, use `/chrome`, and follow the prompt to install the
+extension. That's the whole thing — the bot picks it up automatically, because
+it's a property of the CLI rather than of this repo. Chrome must be running.
 
-### Using your everyday logins
+### How it behaves
 
-You cannot point this at your live main profile. Chrome ignores remote debugging
-on the default `--user-data-dir` outright, and that is not a flag you can turn
-off — it's the fix for a real cookie-theft technique.
+Claude works in **its own tab group**, created on first use. It won't read or
+disturb the tabs you already have open; it opens its own and works there. You'll
+see tool calls stream past as `🔧 mcp__claude-in-chrome__navigate` and
+`🔧 mcp__claude-in-chrome__get_page_text`.
 
-The supported way to carry your logins across is **Chrome Sync**: open
-`!browser`, sign into Chrome itself with your Google account, and your saved
-passwords, autofill and bookmarks land in the automation profile. Cookies are
-not synced, so you still sign into each site once — but the password is filled
-in for you, so it's a couple of clicks rather than a lookup.
+Because it reads page text rather than only screenshots, it's accurate and cheap
+compared with driving the screen through `!click`.
 
-Do that first sign-in yourself, through `!browser`. Google and most large sites
-detect automation-controlled browsers and refuse to complete a login in one, so
-the reliable pattern is: **you** authenticate once, then Claude reuses the
-session for as long as it lasts.
+> **This is the widest permission in the whole bot.** Every site you are signed
+> into is reachable by any prompt you send — mail, bank, shopping, GitHub, the
+> lot. Combined with the default `bypassPermissions`, Claude will not ask before
+> clicking something on a page. Read the [Security](#security--read-this)
+> section before you use this from your phone, and be specific in prompts that
+> touch anything transactional.
 
-Copying your real profile directory into the automation path is the other thing
-people try. It sometimes works, it puts a second copy of every cookie you own on
-disk, and it breaks whenever Chrome rotates its encryption scheme. Not
-recommended.
+### Alternative: an isolated profile
 
-> **What this changes about the trust model:** any site signed into that profile
-> is readable by any prompt you send. Sign in only to what you actually want
-> reachable — and note that `bypassPermissions` means Claude won't ask before
-> clicking something on a page. Treat "buy it for me" prompts with the caution
-> that implies.
+If you'd rather Claude *not* see your everyday logins, `mcp.json.example`
+configures [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)
+against a dedicated Chrome profile instead. Copy it to `mcp.json`, point
+`--user-data-dir` at a path you own, set `CLAUDE_CHROME=false`, and use
+`!browser` to sign into just the sites you want reachable.
+
+That route can't use your main profile: since Chrome 136, remote debugging is
+ignored on the default `--user-data-dir`, which is the fix for a real
+cookie-theft technique. Use one or the other — running both gives Claude two
+browser toolsets and it will pick badly.
 
 ---
 
@@ -301,7 +282,8 @@ The ones worth knowing:
 | `AUTO_SCREENSHOT` | `true` | Screenshot after every successful Claude turn. |
 | `BARE_MESSAGE_IS_PROMPT` | `true` | Set `false` to require the `!claude` prefix. |
 | `CLAUDE_TIMEOUT` | `1800` | Seconds before a Claude turn is force-stopped. |
-| `MCP_CONFIG` | `mcp.json` beside `bot.py` | MCP servers handed to Claude. See [Browser control](#browser-control). |
+| `CLAUDE_CHROME` | `true` | Let Claude drive your real Chrome. See [Browser control](#browser-control). |
+| `MCP_CONFIG` | `mcp.json` beside `bot.py` | Extra MCP servers handed to Claude. |
 
 ---
 
@@ -321,6 +303,9 @@ risk. What protects you is exactly two things:
 Worth knowing:
 
 - Turn on 2FA for the Discord account that owns the bot.
+- With `CLAUDE_CHROME=true` (the default), the reach of a prompt is *every site
+  you are signed into in Chrome*, not just this machine's files. That is the
+  single biggest thing to think about here. `CLAUDE_CHROME=false` removes it.
 - Screenshots and `!watch` send whatever is on screen — password managers,
   private messages, anything — to Discord's servers, where they persist in your
   DM history until you delete them.
