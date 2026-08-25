@@ -754,6 +754,29 @@ async def cmd_open(ctx: Ctx) -> None:
     await ctx.ok(await asyncio.to_thread(sysctl.open_target, ctx.rest, ctx.state.cwd))
 
 
+@command(
+    "browser",
+    "!browser [url]",
+    "Open Chrome on the profile Claude browses with, so you can sign into sites.",
+    "System",
+    aliases=("chrome",),
+)
+async def cmd_browser(ctx: Ctx) -> None:
+    profile = config.browser_profile_dir()
+    if not profile:
+        await ctx.fail(
+            "No browser profile configured. Copy `mcp.json.example` to `mcp.json`, "
+            "set `--user-data-dir=`, and restart the bot."
+        )
+        return
+    try:
+        note = await asyncio.to_thread(sysctl.launch_browser, profile, ctx.rest)
+    except FileNotFoundError as exc:
+        await ctx.fail(str(exc))
+        return
+    await ctx.ok(f"{note}\nSign in here and Claude keeps the session. Close it before browsing.")
+
+
 @command("clip", "!clip [text]", "Read the clipboard, or set it.", "System", aliases=("clipboard",))
 async def cmd_clip(ctx: Ctx) -> None:
     if ctx.rest:

@@ -174,6 +174,7 @@ All screen capture is limited to the primary monitor — secondary displays are 
 | `!procs [filter]` · `!kill <pid\|name> [force]` | Process list and termination. |
 | `!windows` · `!focus <title>` | List windows / bring one to the front. |
 | `!open <app\|file\|url>` | Open anything the way Explorer would. |
+| `!browser [url]` | Open Chrome on the profile Claude browses with, to sign into sites (alias `!chrome`). |
 | `!clip [text]` | Read or set the clipboard. |
 | `!vol <0-100\|up\|down\|mute>` | System volume. |
 
@@ -182,6 +183,59 @@ All screen capture is limited to the primary monitor — secondary displays are 
 |---|---|
 | `!lock` · `!sleep` | Lock or suspend. |
 | `!shutdown [secs]` · `!reboot [secs]` · `!abort` | Default 60s delay; `!abort` cancels. |
+
+---
+
+## Browser control
+
+Optional. Gives Claude a real Chrome it can drive — navigate, read the DOM,
+click, fill forms — so prompts like *"check my cart on the site I'm signed into
+and tell me what's in it"* work. It reads the live page, not a screenshot, so
+it's accurate and cheap compared to clicking around with `!click`.
+
+This runs on a **dedicated Chrome profile**, not your everyday one. That isn't a
+style choice: since Chrome 136, `--remote-debugging-port` is ignored on the
+default profile, because a debuggable browser is a cookie-theft vector. A
+separate profile gets its own encryption key. The upside is that Claude only
+ever sees the sites you deliberately signed into on that profile.
+
+### 1. Point the config at a profile directory
+
+```powershell
+copy mcp.json.example mcp.json
+notepad mcp.json     # set --user-data-dir to a path you own
+```
+
+The directory is created on first use. Requires Node.js — `npx` fetches
+[`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)
+on demand. Restart the bot; it passes the file to Claude with `--mcp-config`.
+
+### 2. Sign in, once
+
+```
+!browser https://example.com
+```
+
+That opens Chrome on the automation profile. Log in normally and the cookies
+persist there for good. You can do this remotely: `!browser`, then `!ss` to see
+the screen and `!click` / `!type` to work the login form over Discord. **Close
+the window when you're done** — Chrome and the MCP server can't share one
+profile directory at the same time.
+
+### 3. Ask for it
+
+```
+look through my cart on <site> and tell me what's in it
+```
+
+Claude opens the page in that profile, reads it, and answers. You'll see the
+tool calls stream past as `🔧 mcp__chrome-devtools__navigate_page`.
+
+> **What this changes about the trust model:** any site signed into that profile
+> is readable by any prompt you send. Sign in only to what you actually want
+> reachable — and note that `bypassPermissions` means Claude won't ask before
+> clicking something on a page. Treat "buy it for me" prompts with the caution
+> that implies.
 
 ---
 
@@ -199,6 +253,7 @@ The ones worth knowing:
 | `AUTO_SCREENSHOT` | `true` | Screenshot after every successful Claude turn. |
 | `BARE_MESSAGE_IS_PROMPT` | `true` | Set `false` to require the `!claude` prefix. |
 | `CLAUDE_TIMEOUT` | `1800` | Seconds before a Claude turn is force-stopped. |
+| `MCP_CONFIG` | `mcp.json` beside `bot.py` | MCP servers handed to Claude. See [Browser control](#browser-control). |
 
 ---
 
@@ -238,5 +293,6 @@ Worth knowing:
 | `usage.py` | Plan rate limits (OAuth endpoint) + local token accounting. |
 | `screen.py` | Screenshots, GIF recording, webcam. |
 | `sysctl.py` | Mouse/keyboard, processes, clipboard, volume, power, windows. |
-| `config.py` | `.env` loading. |
+| `config.py` | `.env` loading, MCP config discovery. |
+| `mcp.json.example` | Template for the Chrome MCP server. Copy to `mcp.json`. |
 | `.state/sessions.json` | Per-channel Claude session IDs and working directories. |

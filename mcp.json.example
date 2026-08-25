@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Copy this to mcp.json to give Claude browser control. See the 'Browser control'",
+    "section of the README. Change the --user-data-dir path to a directory you own;",
+    "it must NOT be your normal Chrome profile, because Chrome 136+ refuses remote",
+    "debugging on the default profile. Log into your sites once in that profile and",
+    "the cookies persist there for every later run."
+  ],
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--user-data-dir=C:\\Users\\you\\.claudle\\chrome-profile"
+      ]
+    }
+  }
+}

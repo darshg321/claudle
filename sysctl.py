@@ -288,6 +288,36 @@ def open_target(target: str, cwd: str | None = None) -> str:
     return f"asked Windows to start {target}"
 
 
+CHROME_CANDIDATES = (
+    r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+    r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+    r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+)
+
+
+def launch_browser(profile_dir: str, url: str = "") -> str:
+    """Open Chrome on the automation profile so the owner can sign into sites.
+
+    Deliberately the same --user-data-dir the MCP server uses: cookies set here
+    are the cookies Claude will browse with later.
+    """
+    exe = shutil.which("chrome")
+    if not exe:
+        for candidate in CHROME_CANDIDATES:
+            expanded = os.path.expandvars(candidate)
+            if os.path.exists(expanded):
+                exe = expanded
+                break
+    if not exe:
+        raise FileNotFoundError("Could not find chrome.exe — install Chrome or add it to PATH.")
+
+    args = [exe, f"--user-data-dir={profile_dir}", "--no-first-run", "--no-default-browser-check"]
+    if url:
+        args.append(url)
+    subprocess.Popen(args, creationflags=subprocess.CREATE_NO_WINDOW)
+    return f"opened Chrome on the automation profile ({profile_dir})"
+
+
 def list_windows() -> list[str]:
     """Titles of visible top-level windows."""
     user32 = ctypes.windll.user32

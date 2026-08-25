@@ -103,6 +103,8 @@ class ClaudeSession:
         ]
         if config.CLAUDE_PERMISSION_MODE == "bypassPermissions":
             args.append("--dangerously-skip-permissions")
+        if config.MCP_CONFIG:
+            args += ["--mcp-config", config.MCP_CONFIG]
         if config.CLAUDE_MODEL:
             args += ["--model", config.CLAUDE_MODEL]
         if config.CLAUDE_EFFORT:

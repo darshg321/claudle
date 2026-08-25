@@ -1,4 +1,5 @@
 """Configuration loading for the PC control bot."""
+import json
 import os
 from pathlib import Path
 
@@ -44,6 +45,12 @@ CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermiss
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()
 CLAUDE_TIMEOUT = _int("CLAUDE_TIMEOUT", 1800)
 
+# Extra tools handed to Claude via MCP — browser control lives here. Defaults to
+# mcp.json beside this file when it exists. A path that does not exist is
+# ignored rather than fatal, so the bot still runs with plain Claude.
+_mcp = os.environ.get("MCP_CONFIG", "").strip() or str(ROOT / "mcp.json")
+MCP_CONFIG = _mcp if Path(_mcp).is_file() else ""
+
 SHELL_TIMEOUT = _int("SHELL_TIMEOUT", 180)
 AUTO_SCREENSHOT = _bool("AUTO_SCREENSHOT", True)
 BARE_MESSAGE_IS_PROMPT = _bool("BARE_MESSAGE_IS_PROMPT", True)
@@ -52,6 +59,25 @@ BARE_MESSAGE_IS_PROMPT = _bool("BARE_MESSAGE_IS_PROMPT", True)
 MAX_UPLOAD_BYTES = _int("MAX_UPLOAD_BYTES", 7_500_000)
 
 SESSION_FILE = STATE_DIR / "sessions.json"
+
+
+def browser_profile_dir() -> str:
+    """The Chrome profile the MCP browser server drives, read back out of MCP_CONFIG.
+
+    Parsed rather than configured separately so `!browser` can never open a
+    different profile than the one Claude actually sees.
+    """
+    if not MCP_CONFIG:
+        return ""
+    try:
+        data = json.loads(Path(MCP_CONFIG).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    for server in (data.get("mcpServers") or {}).values():
+        for arg in server.get("args") or []:
+            if isinstance(arg, str) and arg.startswith("--user-data-dir="):
+                return arg.split("=", 1)[1]
+    return ""
 
 
 def validate() -> list[str]:
