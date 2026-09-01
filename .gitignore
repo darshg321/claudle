@@ -3,3 +3,5 @@ mcp.json
 .state/
 __pycache__/
 *.pyc
+startup.log
+startup.log.old
