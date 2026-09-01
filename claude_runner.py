@@ -39,6 +39,13 @@ class RunResult:
     stderr: str = ""
     cancelled: bool = False
     returncode: int | None = None
+    # Cache accounting. A healthy resumed turn is nearly all cache_read; a large
+    # cache_write means something invalidated the prefix and the whole history
+    # was reprocessed. `!usage` surfaces the ratio so a regression is visible.
+    cache_read: int = 0
+    cache_write: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 def _summarize_tool(name: str, tool_input: dict) -> str:
@@ -71,11 +78,24 @@ def _text_of(content) -> str:
 
 
 class ClaudeSession:
-    """One Claude Code conversation, resumable across bot restarts."""
+    """One Claude Code conversation, resumable across bot restarts.
 
-    def __init__(self, cwd: str, session_id: str | None = None):
+    `model` and `effort` are per-conversation overrides. Both are part of the
+    prompt cache key, so changing either mid-conversation costs a full uncached
+    re-read of the history — `!model` and `!effort` say so before they switch.
+    """
+
+    def __init__(
+        self,
+        cwd: str,
+        session_id: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ):
         self.cwd = cwd
         self.session_id = session_id
+        self.model = model or config.CLAUDE_MODEL
+        self.effort = effort or config.CLAUDE_EFFORT
         self._process: asyncio.subprocess.Process | None = None
 
     @property
@@ -104,12 +124,16 @@ class ClaudeSession:
         if config.CLAUDE_PERMISSION_MODE == "bypassPermissions":
             args.append("--dangerously-skip-permissions")
         args.append("--chrome" if config.CLAUDE_CHROME else "--no-chrome")
+        if config.CLAUDE_STABLE_PREFIX:
+            args.append("--exclude-dynamic-system-prompt-sections")
         if config.MCP_CONFIG:
             args += ["--mcp-config", config.MCP_CONFIG]
-        if config.CLAUDE_MODEL:
-            args += ["--model", config.CLAUDE_MODEL]
-        if config.CLAUDE_EFFORT:
-            args += ["--effort", config.CLAUDE_EFFORT]
+        if self.model:
+            args += ["--model", self.model]
+        if self.effort:
+            args += ["--effort", self.effort]
+        if config.CLAUDE_MAX_BUDGET_USD > 0:
+            args += ["--max-budget-usd", str(config.CLAUDE_MAX_BUDGET_USD)]
         if resume and self.session_id:
             args += ["--resume", self.session_id]
         return args
@@ -259,4 +283,9 @@ class ClaudeSession:
             run.num_turns = int(event.get("num_turns") or 0)
             run.duration_ms = int(event.get("duration_ms") or 0)
             run.cost_usd = float(event.get("total_cost_usd") or 0.0)
+            usage = event.get("usage") or {}
+            run.cache_read = int(usage.get("cache_read_input_tokens") or 0)
+            run.cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+            run.input_tokens = int(usage.get("input_tokens") or 0)
+            run.output_tokens = int(usage.get("output_tokens") or 0)
             await on_event({"kind": "result", "result": run})

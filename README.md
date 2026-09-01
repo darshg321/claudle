@@ -84,6 +84,35 @@ DM the bot `!ss`. You should get a screenshot of your desktop back. If that
 works, try a bare message like `what version of python is installed?` to
 exercise the Claude path.
 
+### 7. Optional: start it with Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-startup.ps1
+```
+
+This puts a `Claudle` shortcut in your Startup folder and registers it as
+**disabled**, so it appears in **Task Manager > Startup apps** but does not run
+until you select it and click **Enable**. Since the bot is remote control of
+this machine, off is the only sane default — turning it on is a deliberate
+click.
+
+Once enabled it launches at sign-in through `pythonw.exe`, so there is no
+console window; the tray icon is still your way to see and stop it. Anything it
+would have printed goes to `startup.log` in this folder — check there first if
+the tray icon never appears.
+
+The script and Task Manager write the same registry state, so either can flip
+it:
+
+```powershell
+.\install-startup.ps1 -Action Status      # installed? enabled or disabled?
+.\install-startup.ps1 -Action Enable      # same as Task Manager's Enable
+.\install-startup.ps1 -Action Disable
+.\install-startup.ps1 -Action Uninstall   # remove the shortcut entirely
+```
+
+Everything is per-user under `HKCU` — no admin rights, nothing machine-wide.
+
 ### Troubleshooting
 
 | Symptom | Cause |
@@ -120,10 +149,32 @@ Run `!help` for the live list, or `!help <command>` for details.
 | | |
 |---|---|
 | `!claude <prompt>` | Run a prompt (aliases `!c`, `!ask`). Any bare message does the same. |
-| `!new` | Forget the conversation and start a fresh session. |
-| `!session [id]` | Show the current session ID, or resume a specific one. |
+| `!convo` | List named conversations (aliases `!chat`, `!convos`). |
+| `!convo <label>` | Switch to one. |
+| `!convo new <label> [dir]` | Start a new one, optionally in another directory. |
+| `!convo rename <a> <b>` / `!convo drop <label>` | Housekeeping. |
+| `!new` | Wipe the active conversation's history, keeping its label. |
+| `!model [alias]` | Show or set the model for this conversation. |
+| `!effort [level]` | Show or set reasoning effort for this conversation. |
+| `!session [id]` | Show the session ID, or resume a specific one. |
+| `!window [anchor]` | 5-hour window status, or open a new one now. |
 | `!cancel` | Kill the turn in progress. |
 | `!usage [hours]` | Plan limits and tokens spent locally (aliases `!limits`, `!quota`). |
+
+**Self-editing**
+| | |
+|---|---|
+| `!self <what to change>` | Run Claude against the bot's own source (alias `!edit`). |
+| `!diff [path]` | Uncommitted changes to the bot. |
+| `!log [n]` | Recent commits. |
+| `!commit [message]` | Stage everything and commit. |
+| `!relaunch` | Restart the bot process (alias `!reload`). |
+
+> `!relaunch` restarts **the bot**. `!restart` is an alias of `!reboot` and
+> restarts **the PC** — the two were deliberately not merged.
+
+`!relaunch` refuses to restart if the source does not compile, so a syntax error
+introduced by `!self` cannot take the bot off Discord with no way back in.
 
 Anthropic reports subscription limits as a **percentage of a rolling window**
 (5-hour and 7-day), never as a token quota — so `!usage` shows those percentages
@@ -276,14 +327,84 @@ The ones worth knowing:
 | Key | Default | Effect |
 |---|---|---|
 | `DEFAULT_WORKDIR` | your home dir | Where Claude and the shell start. |
-| `CLAUDE_MODEL` | your CLI default | `opus`, `sonnet`, `haiku`, or a full model ID. |
-| `CLAUDE_EFFORT` | CLI default | `low` … `max`. |
+| `CLAUDE_MODEL` | your CLI default | `opus`, `sonnet`, `haiku`, `fable`, or a full model ID. `!model` overrides per conversation. |
+| `CLAUDE_EFFORT` | `medium` | `low` … `max`. Effort drives thinking tokens, which bill as output. `!effort` overrides per conversation. |
+| `CLAUDE_STABLE_PREFIX` | `true` | Keep the system prompt byte-identical between invocations. See [Token usage](#token-usage). |
+| `CLAUDE_MAX_BUDGET_USD` | `0` (off) | Hard per-turn spend ceiling. |
+| `WINDOW_WATCH` | `true` | DM when the 5-hour usage window resets. |
+| `WINDOW_WARM` | `true` | Anchor the next window with a tiny probe on reset. |
 | `CLAUDE_PERMISSION_MODE` | `bypassPermissions` | Set to `acceptEdits` or `plan` for a tighter leash. |
 | `AUTO_SCREENSHOT` | `true` | Screenshot after every successful Claude turn. |
 | `BARE_MESSAGE_IS_PROMPT` | `true` | Set `false` to require the `!claude` prefix. |
 | `CLAUDE_TIMEOUT` | `1800` | Seconds before a Claude turn is force-stopped. |
 | `CLAUDE_CHROME` | `true` | Let Claude drive your real Chrome. See [Browser control](#browser-control). |
 | `MCP_CONFIG` | `mcp.json` beside `bot.py` | Extra MCP servers handed to Claude. |
+
+---
+
+## Token usage
+
+A chat bot is an unusually bad shape for prompt caching, and it is worth knowing
+why before tuning anything else.
+
+Claude Code re-sends the whole conversation on every request and relies on the
+API's prefix cache to make that cheap. The match is exact: **a change anywhere in
+the prefix reprocesses everything after it.** Interactively that is fine, because
+one long-lived process holds one stable prefix. This bot instead spawns a fresh
+`claude -p --resume` per Discord message, which Claude Code treats as a
+*sequential session* — and a sequential session only reuses the prefix if the
+system prompt still matches byte for byte.
+
+That system prompt embeds the working directory, platform, shell, OS version,
+memory paths, **and a git status snapshot (branch + recent commits)**. So a
+commit, a branch switch, or a `!cd` between two prompts invalidates the prefix
+and re-reads the whole conversation at full input price.
+
+`CLAUDE_STABLE_PREFIX=true` (the default) passes
+`--exclude-dynamic-system-prompt-sections`, which moves those sections into the
+first user message — replayed verbatim on resume, so the prefix stops moving.
+Measured on this repo, resuming a session across a commit:
+
+| | cache re-created | cache read |
+|---|---:|---:|
+| without the flag | 7,691 | 15,645 |
+| with the flag | 3,739 | 19,419 |
+
+The tradeoff is that Claude sees cwd and environment as user-turn context rather
+than system-prompt context, so it weighs them slightly less heavily.
+
+The other levers, roughly in order of effect:
+
+- **Keep conversations short.** History is re-sent every turn, and a cache miss
+  re-reads all of it. `!convo new` per task beats one immortal transcript; the
+  bot nudges you at 40 turns.
+- **Match effort to the task.** `CLAUDE_EFFORT` and `!effort` control thinking
+  tokens, which bill as output. `high` on every "what's in this folder" is real
+  money.
+- **Don't switch model or effort mid-conversation.** Both are part of the cache
+  key, so a switch re-reads the whole history. `!model` and `!effort` warn when
+  the active conversation already has a session.
+- **Watch the footer.** Every turn reports its cache hit rate, and flags a turn
+  that re-cached more than 20k tokens on a resume — that is the symptom of a
+  prefix that moved.
+
+`AUTO_SCREENSHOT` costs no tokens; the screenshot goes to Discord, not to Claude.
+Likewise `--verbose` and `stream-json` are local plumbing.
+
+### Usage windows
+
+Subscription limits are a **rolling 5-hour window** that opens on your first
+request and closes five hours later. Left alone it drifts to whenever you next
+happen to be at the keyboard, so a long session can hit a ceiling that arrived at
+an unpredictable hour.
+
+With `WINDOW_WATCH` on, the bot polls the usage endpoint (a plain HTTPS GET — no
+tokens) and DMs you the moment the window rolls over. With `WINDOW_WARM` on it
+also fires one minimal probe at that moment to pin the next window to a boundary
+you know. Usage windows are shared across models, so a Haiku probe opens exactly
+the window Opus later draws on; one anchor costs about 6.5k tokens, most of them
+cache reads. `!window` shows the current state and `!window anchor` opens one on
+demand.
 
 ---
 
@@ -324,9 +445,14 @@ Worth knowing:
 | `bot.py` | Discord client, command table, Claude progress UI. |
 | `claude_runner.py` | Claude Code CLI subprocess + `stream-json` parsing. |
 | `usage.py` | Plan rate limits (OAuth endpoint) + local token accounting. |
+| `convos.py` | Named, switchable conversations; the `.state/sessions.json` format. |
+| `window.py` | 5-hour window watcher, reset alerts, and the anchor probe. |
 | `screen.py` | Screenshots, GIF recording, webcam. |
 | `ui.py` | Tray icon and the live task HUD. |
 | `sysctl.py` | Mouse/keyboard, processes, clipboard, volume, power, windows. |
 | `config.py` | `.env` loading, MCP config discovery. |
 | `mcp.json.example` | Template for the Chrome MCP server. Copy to `mcp.json`. |
-| `.state/sessions.json` | Per-channel Claude session IDs and working directories. |
+| `startup.pyw` | Console-less entry point for the startup shortcut; logs to `startup.log`. |
+| `install-startup.ps1` | Registers/removes the Task Manager startup entry. |
+| `.state/sessions.json` | Per-channel named conversations: session IDs, directories, model/effort. |
+| `.state/window.json` | Last-seen 5-hour window reset, so a restart doesn't re-announce it. |

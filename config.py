@@ -42,8 +42,32 @@ PREFIX = os.environ.get("COMMAND_PREFIX", "!").strip() or "!"
 DEFAULT_WORKDIR = os.environ.get("DEFAULT_WORKDIR", "").strip() or str(Path.home())
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions").strip()
-CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()
+
+# Claude Code's own default is xhigh, tuned for long autonomous coding runs.
+# Most messages sent to a chat bot are not that, and effort drives thinking
+# tokens, which bill as output. `medium` is the better default here; !effort
+# raises it per conversation when a task actually needs it.
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip() or "medium"
 CLAUDE_TIMEOUT = _int("CLAUDE_TIMEOUT", 1800)
+
+# Models offered by `!model`. Aliases resolve to the newest model in the family,
+# so this list does not go stale when a new release lands.
+MODELS = ("opus", "sonnet", "haiku", "fable")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# Every prompt spawns a fresh `claude -p --resume`, which Claude Code treats as a
+# *sequential session*. Its system prompt embeds the cwd, platform, shell, OS
+# version, memory paths and a git status snapshot (branch + recent commits), so
+# any of those changing between two prompts invalidates the cached prefix and
+# re-reads the whole conversation at full price. This flag moves those sections
+# into the first user message — which is replayed verbatim on resume — leaving a
+# byte-identical system prompt across invocations. Measured on this repo: ~50%
+# less cache re-creation on a resume that followed a commit.
+CLAUDE_STABLE_PREFIX = _bool("CLAUDE_STABLE_PREFIX", True)
+
+# Hard ceiling per turn, in dollars. A runaway agentic loop is the one failure
+# mode that can spend a whole 5-hour window on a single prompt. 0 disables.
+CLAUDE_MAX_BUDGET_USD = float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "0").strip() or 0)
 
 # "Claude in Chrome": the CLI talks to the Claude Code browser extension over
 # native messaging, so Claude drives the Chrome you already use, with the
@@ -65,6 +89,24 @@ BARE_MESSAGE_IS_PROMPT = _bool("BARE_MESSAGE_IS_PROMPT", True)
 MAX_UPLOAD_BYTES = _int("MAX_UPLOAD_BYTES", 7_500_000)
 
 SESSION_FILE = STATE_DIR / "sessions.json"
+WINDOW_FILE = STATE_DIR / "window.json"
+
+# --------------------------------------------------------------- usage windows
+
+# Watch the subscription's rolling 5-hour window and DM when it resets.
+WINDOW_WATCH = _bool("WINDOW_WATCH", True)
+
+# On reset, fire one tiny prompt to anchor the next window at a known time.
+# The window is rolling and starts at your *first* request, so an unanchored
+# window drifts to whenever you happen to next be at the keyboard. Anchoring
+# costs ~1.3k cached tokens on Haiku; the window is shared across models, so a
+# Haiku anchor opens the same window Opus later draws on.
+WINDOW_WARM = _bool("WINDOW_WARM", True)
+WINDOW_WARM_MODEL = os.environ.get("WINDOW_WARM_MODEL", "").strip() or "haiku"
+WINDOW_POLL_SECONDS = _int("WINDOW_POLL_SECONDS", 300)
+
+# The bot's own source tree — where `!self` and `!commit` operate.
+SELF_DIR = str(ROOT)
 
 
 def browser_profile_dir() -> str:

@@ -21,10 +21,12 @@ import discord
 
 import claude_runner
 import config
+import convos
 import screen
 import sysctl
 import ui
 import usage
+import window
 
 # --------------------------------------------------------------------------- state
 
@@ -53,14 +55,64 @@ def command(name: str, usage: str, help_text: str, group: str, aliases: tuple[st
 
 
 class ChannelState:
-    def __init__(self, cwd: str):
-        self.cwd = cwd
-        self.session = claude_runner.ClaudeSession(cwd)
+    """Live per-channel state, layered over the persisted conversation set.
+
+    `cwd` and `session` are views onto whichever conversation is active, so the
+    rest of the bot keeps working against the same two attributes it always did.
+    """
+
+    def __init__(self, store: convos.ChannelConvos):
+        self.store = store
         self.claude_task: asyncio.Task | None = None
         self.watch_task: asyncio.Task | None = None
+        # One live ClaudeSession per label. These are long-lived because
+        # `!cancel` needs the object that owns the running subprocess.
+        self._sessions: dict[str, claude_runner.ClaudeSession] = {}
+
+    @property
+    def convo(self) -> convos.Convo:
+        return self.store.current
+
+    @property
+    def cwd(self) -> str:
+        return self.convo.cwd
+
+    @cwd.setter
+    def cwd(self, value: str) -> None:
+        self.convo.cwd = value
+        if self.convo.label in self._sessions:
+            self._sessions[self.convo.label].cwd = value
+
+    @property
+    def session(self) -> claude_runner.ClaudeSession:
+        convo = self.convo
+        session = self._sessions.get(convo.label)
+        if session is None:
+            session = claude_runner.ClaudeSession(
+                convo.cwd, convo.session_id, convo.model, convo.effort
+            )
+            self._sessions[convo.label] = session
+        return session
+
+    def reset_session(self) -> None:
+        """Drop the active conversation's transcript and start a fresh one."""
+        convo = self.convo
+        convo.session_id = None
+        convo.turns = 0
+        self._sessions.pop(convo.label, None)
+
+    def sync(self) -> None:
+        """Persist whatever the live session learned back onto the conversation."""
+        convo = self.convo
+        session = self._sessions.get(convo.label)
+        if session is not None:
+            convo.session_id = session.session_id
+            convo.cwd = session.cwd
+        convo.last_used = time.time()
 
 
 STATES: dict[int, ChannelState] = {}
+CONVOS: dict[int, convos.ChannelConvos] = {}
 
 UI = ui.DesktopUI()
 
@@ -69,36 +121,26 @@ UI = ui.DesktopUI()
 # the tray's "Kill current task" and the HUD's Kill button act on it.
 LOOP: asyncio.AbstractEventLoop | None = None
 ACTIVE_CTX: "Ctx | None" = None
+WINDOW_TASK: asyncio.Task | None = None
 
 
 def state_for(channel_id: int) -> ChannelState:
     if channel_id not in STATES:
-        STATES[channel_id] = ChannelState(config.DEFAULT_WORKDIR)
-        saved = _load_sessions().get(str(channel_id))
-        if saved:
-            STATES[channel_id].cwd = saved.get("cwd", config.DEFAULT_WORKDIR)
-            STATES[channel_id].session = claude_runner.ClaudeSession(
-                STATES[channel_id].cwd, saved.get("session_id")
-            )
+        if not CONVOS:
+            CONVOS.update(convos.load())
+        store = CONVOS.get(channel_id)
+        if store is None:
+            store = convos.ChannelConvos(config.DEFAULT_WORKDIR)
+            CONVOS[channel_id] = store
+        STATES[channel_id] = ChannelState(store)
     return STATES[channel_id]
 
 
-def _load_sessions() -> dict:
-    try:
-        return json.loads(config.SESSION_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
 def save_sessions() -> None:
-    data = {
-        str(cid): {"session_id": st.session.session_id, "cwd": st.cwd}
-        for cid, st in STATES.items()
-    }
-    try:
-        config.SESSION_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    for channel_id, state in STATES.items():
+        state.sync()
+        CONVOS[channel_id] = state.store
+    convos.save(CONVOS)
 
 
 # ------------------------------------------------------------------------ plumbing
@@ -301,12 +343,13 @@ async def _drive_claude(ctx: Ctx, prompt: str) -> None:
 
 
 async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
+    convo = ctx.state.convo
     session = ctx.state.session
     session.cwd = ctx.state.cwd
     resuming = bool(session.session_id)
 
     header = (
-        f"🧠 **Claude Code** · `{ctx.state.cwd}`\n"
+        f"🧠 **Claude Code** · `{convo.label}` · `{ctx.state.cwd}`\n"
         f"{'↩️ resuming session' if resuming else '🆕 new session'}"
     )
     status = LiveStatus(await ctx.send(f"{header}\n⏳ starting…"), header)
@@ -357,6 +400,7 @@ async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
         return
 
     final = final or result
+    convo.turns += 1
     save_sessions()
 
     footer_bits = []
@@ -368,9 +412,27 @@ async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
         footer_bits.append(f"${final.cost_usd:.4f}")
     if final.tools_used:
         footer_bits.append(f"{len(final.tools_used)} tool calls")
+
+    # Cache health, because it is the single biggest lever on this bot's token
+    # spend and an invisible regression otherwise. A resumed turn should be
+    # mostly reads; a big write means something invalidated the prefix.
+    served = final.cache_read + final.cache_write + final.input_tokens
+    if served:
+        hit = 100 * final.cache_read / served
+        footer_bits.append(f"{hit:.0f}% cached")
+        if resuming and hit < 60 and final.cache_write > 20_000:
+            footer_bits.append(f"⚠️ {final.cache_write:,} re-cached")
+
     icon = "❌" if final.is_error else "✅"
     status.replace_header(f"{header}\n{icon} done · {' · '.join(footer_bits) or 'no stats'}")
     await status.flush(force=True)
+
+    if convo.turns == convos.BUSY_TURNS:
+        await ctx.send(
+            f"📊 `{convo.label}` has hit {convo.turns} turns. Every prompt now re-sends "
+            f"all of it. If you have moved on to something else, `{config.PREFIX}convo new <label>` "
+            f"is cheaper than continuing here."
+        )
 
     body = final.text or "\n\n".join(texts)
     if body.strip():
@@ -393,16 +455,62 @@ async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
 
 @command("usage", "!usage [hours]", "Claude plan limits and tokens spent on this machine.", "Claude Code", aliases=("limits", "quota"))
 async def cmd_usage(ctx: Ctx) -> None:
-    window = float(ctx.rest) if ctx.rest.replace(".", "", 1).isdigit() else 5.0
-    window = max(0.1, min(window, 24 * 7))
+    # Local name `window` would shadow the module of the same name.
+    hours = float(ctx.rest) if ctx.rest.replace(".", "", 1).isdigit() else 5.0
+    hours = max(0.1, min(hours, 24 * 7))
     async with ctx.channel.typing():
         try:
             payload = await asyncio.to_thread(usage.fetch_limits)
         except usage.UsageError as exc:
             await ctx.fail(str(exc))
             return
-        tokens = await asyncio.to_thread(usage.local_tokens, window)
+        tokens = await asyncio.to_thread(usage.local_tokens, hours)
     await ctx.long(usage.report(payload, tokens), lang="")
+
+
+@command(
+    "window",
+    "!window [anchor]",
+    "Show the 5-hour usage window, or open a new one with a tiny probe.",
+    "Claude Code",
+    aliases=("win",),
+)
+async def cmd_window(ctx: Ctx) -> None:
+    async with ctx.channel.typing():
+        try:
+            state = await asyncio.to_thread(window.snapshot)
+        except usage.UsageError as exc:
+            await ctx.fail(str(exc))
+            return
+
+        if ctx.rest.strip().lower() not in ("anchor", "warm", "start"):
+            watching = "on" if config.WINDOW_WATCH else "off"
+            warming = "on" if config.WINDOW_WARM else "off"
+            await ctx.send(
+                f"{window.describe(state)}\n"
+                f"_Reset alerts: **{watching}** · auto-anchor: **{warming}** · "
+                f"`{config.PREFIX}window anchor` opens one now._"
+            )
+            return
+
+        if state["open"]:
+            await ctx.fail(
+                f"A window is already open — anchoring now would not move it.\n{window.describe(state)}"
+            )
+            return
+
+        try:
+            result = await asyncio.to_thread(window.anchor)
+        except Exception as exc:
+            await ctx.fail(f"Anchor failed: {exc}")
+            return
+        fresh = await asyncio.to_thread(window.snapshot)
+
+    spent = result["input"] + result["cache_write"] + result["cache_read"]
+    await ctx.ok(
+        f"Anchored with a {spent:,}-token probe on `{config.WINDOW_WARM_MODEL}`.\n"
+        f"{window.describe(fresh)}"
+    )
 
 
 @command("cancel", "!cancel", "Stop the Claude run in progress.", "Claude Code", aliases=("stopclaude",))
@@ -416,25 +524,332 @@ async def cmd_cancel(ctx: Ctx) -> None:
         await ctx.fail("Nothing is running here.")
 
 
-@command("new", "!new", "Forget the Claude conversation and start fresh.", "Claude Code", aliases=("reset",))
+@command("new", "!new", "Wipe the active conversation's history and start it fresh.", "Claude Code", aliases=("reset",))
 async def cmd_new(ctx: Ctx) -> None:
-    ctx.state.session = claude_runner.ClaudeSession(ctx.state.cwd)
+    ctx.state.reset_session()
     save_sessions()
-    await ctx.ok("Started a new Claude session.")
+    await ctx.ok(f"`{ctx.state.convo.label}` is empty again — the next prompt starts a new session.")
+
+
+@command(
+    "convo",
+    "!convo [<label> | new <label> [dir] | rename <a> <b> | drop <label>]",
+    "List, create and switch between named conversations.",
+    "Claude Code",
+    aliases=("chat", "convos"),  # not "c" — that is already !claude
+)
+async def cmd_convo(ctx: Ctx) -> None:
+    store = ctx.state.store
+    parts = ctx.args
+    p = config.PREFIX
+
+    if not parts:
+        await ctx.long(store.listing(), lang="")
+        await ctx.send(f"_`{p}convo new <label>` to start one · `{p}convo <label>` to switch_")
+        return
+
+    verb = parts[0].lower()
+    rest = parts[1:]
+
+    if verb in ("new", "add"):
+        if not rest:
+            await ctx.fail(f"Name it: `{p}convo new refactor`")
+            return
+        label = rest[0]
+        if not convos.valid_label(label):
+            await ctx.fail("Labels are 1-32 chars: letters, digits, `.`, `_`, `-`.")
+            return
+        if label in store.convos:
+            await ctx.fail(f"`{label}` already exists — `{p}convo {label}` switches to it.")
+            return
+
+        cwd = ctx.state.cwd
+        if len(rest) > 1:
+            target = ctx.resolve(" ".join(rest[1:]))
+            if not target.is_dir():
+                # Without this a typo'd label silently becomes the directory.
+                await ctx.fail(
+                    f"`{target}` is not a directory.\n"
+                    f"Usage: `{p}convo new <label> [directory]` — labels take no spaces."
+                )
+                return
+            cwd = str(target.resolve())
+
+        store.create(label, cwd)
+        save_sessions()
+        await ctx.ok(f"Started `{label}` in `{cwd}`. It is now active.")
+        return
+
+    if verb == "rename":
+        if len(rest) < 2:
+            await ctx.fail(f"Usage: `{p}convo rename old new`")
+            return
+        if not convos.valid_label(rest[1]):
+            await ctx.fail("Labels are 1-32 chars: letters, digits, `.`, `_`, `-`.")
+            return
+        if not store.rename(rest[0], rest[1]):
+            await ctx.fail(f"Could not rename `{rest[0]}` → `{rest[1]}`.")
+            return
+        ctx.state._sessions.pop(rest[0], None)
+        save_sessions()
+        await ctx.ok(f"`{rest[0]}` is now `{rest[1]}`.")
+        return
+
+    if verb in ("drop", "delete", "rm"):
+        if not rest:
+            await ctx.fail(f"Usage: `{p}convo drop <label>`")
+            return
+        if not store.drop(rest[0]):
+            await ctx.fail(f"Could not drop `{rest[0]}` — unknown, or it is the last one left.")
+            return
+        ctx.state._sessions.pop(rest[0], None)
+        save_sessions()
+        await ctx.ok(f"Dropped `{rest[0]}`. Active is now `{store.active}`.")
+        return
+
+    # Anything else is a label to switch to.
+    label = parts[0] if verb != "switch" else (rest[0] if rest else "")
+    convo = store.switch(label)
+    if convo is None:
+        await ctx.fail(f"No conversation called `{label}`. `{p}convo` lists them.")
+        return
+    save_sessions()
+    await ctx.ok(
+        f"Switched to `{convo.label}` · `{convo.cwd}` · "
+        f"{convo.turns} turns{'' if convo.session_id else ' (fresh)'}"
+    )
+
+
+@command(
+    "model",
+    "!model [opus|sonnet|haiku|fable|<id>]",
+    "Show or change the model for the active conversation.",
+    "Claude Code",
+)
+async def cmd_model(ctx: Ctx) -> None:
+    convo = ctx.state.convo
+    p = config.PREFIX
+    if not ctx.rest:
+        current = convo.model or config.CLAUDE_MODEL or "account default"
+        await ctx.send(
+            f"**Model:** `{current}` in `{convo.label}`\n"
+            f"Options: {', '.join(f'`{m}`' for m in config.MODELS)}, or a full model ID.\n"
+            f"_`{p}model default` clears the override._"
+        )
+        return
+
+    choice = ctx.rest.strip()
+    if choice.lower() in ("default", "clear", "reset"):
+        choice = ""
+    elif choice.lower() in config.MODELS:
+        choice = choice.lower()
+    # Anything else is passed through as a full model ID; the CLI validates it.
+
+    if choice == convo.model:
+        await ctx.ok(f"Already on `{choice or 'account default'}`.")
+        return
+
+    convo.model = choice
+    ctx.state._sessions.pop(convo.label, None)
+    save_sessions()
+
+    note = ""
+    if convo.session_id:
+        # Model is part of the prompt cache key, so this is not free.
+        note = (
+            f"\n⚠️ Each model has its own cache, so the next prompt in `{convo.label}` "
+            f"re-reads its whole history uncached. `{p}convo new` avoids that."
+        )
+    await ctx.ok(f"`{convo.label}` now uses `{choice or 'account default'}`.{note}")
+
+
+@command(
+    "effort",
+    "!effort [low|medium|high|xhigh|max]",
+    "Show or change reasoning effort for the active conversation.",
+    "Claude Code",
+)
+async def cmd_effort(ctx: Ctx) -> None:
+    convo = ctx.state.convo
+    p = config.PREFIX
+    if not ctx.rest:
+        await ctx.send(
+            f"**Effort:** `{convo.effort or config.CLAUDE_EFFORT}` in `{convo.label}`\n"
+            f"Options: {', '.join(f'`{e}`' for e in config.EFFORTS)}\n"
+            f"_Effort drives thinking tokens, which bill as output. `medium` suits "
+            f"most chat prompts; raise it for hard multi-step work._"
+        )
+        return
+
+    choice = ctx.rest.strip().lower()
+    if choice not in config.EFFORTS:
+        await ctx.fail(f"Pick one of: {', '.join(config.EFFORTS)}")
+        return
+    if choice == (convo.effort or config.CLAUDE_EFFORT):
+        await ctx.ok(f"Already on `{choice}`.")
+        return
+
+    convo.effort = choice
+    ctx.state._sessions.pop(convo.label, None)
+    save_sessions()
+
+    note = ""
+    if convo.session_id:
+        note = (
+            f"\n⚠️ Effort is part of the cache key too — the next prompt in "
+            f"`{convo.label}` re-reads its history uncached."
+        )
+    await ctx.ok(f"`{convo.label}` now runs at `{choice}` effort.{note}")
 
 
 @command("session", "!session [id]", "Show the Claude session ID, or resume a specific one.", "Claude Code", aliases=("resume",))
 async def cmd_session(ctx: Ctx) -> None:
+    convo = ctx.state.convo
     if ctx.rest:
-        ctx.state.session = claude_runner.ClaudeSession(ctx.state.cwd, ctx.rest.strip())
+        convo.session_id = ctx.rest.strip()
+        ctx.state._sessions.pop(convo.label, None)
         save_sessions()
-        await ctx.ok(f"Next prompt resumes session `{ctx.rest.strip()}`.")
+        await ctx.ok(f"`{convo.label}` will resume session `{convo.session_id}`.")
         return
-    sid = ctx.state.session.session_id
     await ctx.send(
-        f"**Session:** `{sid}`\n**Directory:** `{ctx.state.cwd}`" if sid
-        else f"No session yet in `{ctx.state.cwd}` — the next prompt creates one."
+        f"**Conversation:** `{convo.label}`\n**Session:** `{convo.session_id}`\n"
+        f"**Directory:** `{convo.cwd}`\n**Turns:** {convo.turns}"
+        if convo.session_id
+        else f"`{convo.label}` has no session yet — the next prompt creates one."
     )
+
+
+# ------------------------------------------------------------------------ self-edit
+#
+# The bot edits its own source often enough that doing it by hand — !cd to the
+# repo, prompt, !sh git commit, kill the tray, relaunch — is the slow path. These
+# five commands are that loop, with the bits that are easy to get wrong (which
+# directory, which interpreter, releasing the tray before exec) handled here.
+
+
+async def _git(ctx: Ctx, *args: str) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
+        cwd=config.SELF_DIR,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        stdin=asyncio.subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode or 0, out.decode("utf-8", "replace")
+
+
+@command(
+    "self",
+    "!self <what to change>",
+    "Run Claude against the bot's own source in a dedicated conversation.",
+    "Self",
+    aliases=("edit",),
+)
+async def cmd_self(ctx: Ctx) -> None:
+    if not ctx.rest:
+        await ctx.fail(f"Say what to change, e.g. `{config.PREFIX}self add a !uptime command`")
+        return
+
+    # A dedicated conversation keeps bot-surgery out of whatever else this
+    # channel was working on, and keeps its history short and cheap.
+    store = ctx.state.store
+    if "self" not in store.convos:
+        store.create("self", config.SELF_DIR)
+    else:
+        store.switch("self")
+        store.convos["self"].cwd = config.SELF_DIR
+    save_sessions()
+
+    await ctx.send(
+        f"🔧 Editing myself in `{config.SELF_DIR}` (conversation `self`).\n"
+        f"_When it looks right: `{config.PREFIX}diff`, then `{config.PREFIX}commit`, "
+        f"then `{config.PREFIX}relaunch`._"
+    )
+    await cmd_claude(ctx)
+
+
+@command("diff", "!diff [path]", "Show uncommitted changes to the bot's source.", "Self")
+async def cmd_diff(ctx: Ctx) -> None:
+    args = ["diff", "--stat"] if not ctx.rest else ["diff", "--", ctx.rest.strip()]
+    _, stat = await _git(ctx, *args)
+    _, status = await _git(ctx, "status", "--short")
+    body = f"$ git status --short\n{status or '(clean)'}\n\n$ git {' '.join(args)}\n{stat or '(no changes)'}"
+    await ctx.long(body, lang="diff", filename="selfdiff.txt")
+
+
+@command("log", "!log [n]", "Recent commits to the bot's source.", "Self", aliases=("commits",))
+async def cmd_log(ctx: Ctx) -> None:
+    count = ctx.rest.strip() if ctx.rest.strip().isdigit() else "10"
+    _, out = await _git(ctx, "log", f"-{count}", "--oneline", "--decorate")
+    await ctx.long(out or "(no commits)", lang="")
+
+
+@command("commit", "!commit [message]", "Stage and commit the bot's current changes.", "Self")
+async def cmd_commit(ctx: Ctx) -> None:
+    _, status = await _git(ctx, "status", "--porcelain")
+    if not status.strip():
+        await ctx.fail("Nothing to commit — the working tree is clean.")
+        return
+
+    message = ctx.rest.strip() or "Update the bot from Discord"
+    code, out = await _git(ctx, "add", "-A")
+    if code != 0:
+        await ctx.fail("`git add` failed:")
+        await ctx.long(out, lang="")
+        return
+    code, out = await _git(ctx, "commit", "-m", message)
+    if code != 0:
+        await ctx.fail("`git commit` failed:")
+        await ctx.long(out, lang="")
+        return
+    await ctx.ok(f"Committed.\n```\n{out.strip()[:1500]}\n```")
+
+
+@command(
+    "relaunch",
+    "!relaunch",
+    "Restart the bot process so source changes take effect.",
+    "Self",
+    # Deliberately NOT "restart": that is already an alias of !reboot, which
+    # reboots the whole PC. Two very different blast radii, one word.
+    aliases=("reload", "selfrestart"),
+)
+async def cmd_relaunch(ctx: Ctx) -> None:
+    # Refuse to restart into a file that will not import — a syntax error here
+    # takes the bot off Discord with no way to fix it remotely.
+    entry = Path(config.SELF_DIR) / "startup.pyw"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "py_compile", "bot.py", "config.py",
+        "claude_runner.py", "convos.py", "window.py", "usage.py", "ui.py",
+        "screen.py", "sysctl.py",
+        cwd=config.SELF_DIR,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        await ctx.fail("Refusing to restart — the source does not compile:")
+        await ctx.long(out.decode("utf-8", "replace"), lang="py", filename="syntax.txt")
+        return
+
+    await ctx.ok("Restarting… I will say hello again in a few seconds.")
+    save_sessions()
+
+    # Detach the replacement so it survives this process exiting, then tear the
+    # tray down before quitting or the icon lingers as a ghost.
+    subprocess.Popen(
+        [sys.executable, str(entry)],
+        cwd=config.SELF_DIR,
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
+    await asyncio.sleep(1.0)
+    UI.stop()
+    await client.close()
+    os._exit(0)
 
 
 # ----------------------------------------------------------------------------- shell
@@ -890,7 +1305,7 @@ async def cmd_help(ctx: Ctx) -> None:
         ),
         colour=0xD97757,
     )
-    for group in ("Claude Code", "Shell", "Screen", "Input", "Files", "System", "Power", "Meta"):
+    for group in ("Claude Code", "Self", "Shell", "Screen", "Input", "Files", "System", "Power", "Meta"):
         cmds = groups.get(group)
         if not cmds:
             continue
@@ -909,12 +1324,16 @@ client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready() -> None:
-    global LOOP
+    global LOOP, WINDOW_TASK
     LOOP = asyncio.get_running_loop()
     UI.task_finished("idle")
     print(f"[pccontrol] logged in as {client.user} (id {client.user.id})")
     print(f"[pccontrol] owner: {config.OWNER_ID} · prefix: {config.PREFIX}")
     print(f"[pccontrol] default working directory: {config.DEFAULT_WORKDIR}")
+    print(f"[pccontrol] model: {config.CLAUDE_MODEL or 'account default'} · effort: {config.CLAUDE_EFFORT}")
+    print(f"[pccontrol] stable cache prefix: {config.CLAUDE_STABLE_PREFIX}")
+
+    owner = None
     try:
         owner = await client.fetch_user(config.OWNER_ID)
         await owner.send(
@@ -923,6 +1342,17 @@ async def on_ready() -> None:
         )
     except discord.HTTPException as exc:
         print(f"[pccontrol] could not DM the owner: {exc}")
+
+    # on_ready fires again on every reconnect; only ever run one watcher.
+    if config.WINDOW_WATCH and owner is not None and (WINDOW_TASK is None or WINDOW_TASK.done()):
+        async def notify(text: str) -> None:
+            try:
+                await owner.send(text)
+            except discord.HTTPException as exc:
+                print(f"[pccontrol] could not DM the window reset: {exc}")
+
+        WINDOW_TASK = asyncio.create_task(window.watch(notify))
+        print("[pccontrol] watching the 5-hour usage window")
 
 
 @client.event
@@ -987,6 +1417,8 @@ async def _kill_active(reason: str) -> None:
 
 async def _shutdown() -> None:
     await _kill_active("the desktop")
+    if WINDOW_TASK is not None and not WINDOW_TASK.done():
+        WINDOW_TASK.cancel()
     save_sessions()
     UI.stop()
     await client.close()
