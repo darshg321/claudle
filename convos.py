@@ -25,9 +25,15 @@ BUSY_TURNS = 40
 
 _LABEL_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
+# `!convo <word>` switches, but these words are the subcommand verbs, so a
+# conversation named after one could only ever be reached through the longer
+# `!convo switch <label>`. Refusing them at creation is kinder than shipping an
+# unreachable conversation.
+RESERVED = frozenset({"new", "add", "rename", "drop", "delete", "rm", "switch", "list"})
+
 
 def valid_label(label: str) -> bool:
-    return bool(_LABEL_OK.match(label))
+    return bool(_LABEL_OK.match(label)) and label.lower() not in RESERVED
 
 
 @dataclass
@@ -38,6 +44,12 @@ class Convo:
     model: str = ""
     effort: str = ""
     turns: int = 0
+    # Browser tools cost their definitions in every request of this conversation,
+    # so they stay off until this conversation actually needs them.
+    chrome: bool = config.CLAUDE_CHROME_DEFAULT_ON
+    # Set once the "this conversation is getting expensive" nudge has been shown,
+    # so it fires exactly once instead of only on an exact turn count.
+    warned_busy: bool = False
     created: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
@@ -49,6 +61,8 @@ class Convo:
             bits.append(self.model)
         if self.effort:
             bits.append(self.effort)
+        if self.chrome:
+            bits.append("chrome")
         state = "fresh" if not self.session_id else " · ".join(bits)
         return f"{mark} {self.label:<20} {state}\n    {self.cwd}"
 
@@ -151,6 +165,8 @@ class ChannelConvos:
                 model=blob.get("model") or "",
                 effort=blob.get("effort") or "",
                 turns=int(blob.get("turns") or 0),
+                chrome=bool(blob.get("chrome", config.CLAUDE_CHROME_DEFAULT_ON)),
+                warned_busy=bool(blob.get("warned_busy")),
                 created=float(blob.get("created") or time.time()),
                 last_used=float(blob.get("last_used") or time.time()),
             )

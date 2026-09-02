@@ -8,7 +8,30 @@ STATE_DIR = ROOT / ".state"
 STATE_DIR.mkdir(exist_ok=True)
 
 
+# Environment variables that mean "you are running inside a Claude Code turn".
+# The bot must never inherit these: they belong to whatever session launched it,
+# not to the sessions it spawns. See clean_child_env.
+INHERITED_CLAUDE_VARS = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_PID",
+)
+
+
 def _load_dotenv() -> None:
+    """Load .env, letting the file win over anything already in the environment.
+
+    This used to be setdefault, i.e. the ambient environment won. That is the
+    wrong way round for a bot that is regularly launched *from* a Claude Code
+    session (a terminal inside one, or `!self` → `!relaunch`): a session that
+    exports CLAUDE_EFFORT=high hands the bot an effort level its own .env never
+    asked for, and the bot then quietly bills every prompt at that level. The
+    .env beside bot.py is this program's configuration; nothing upstream of it
+    gets a silent vote.
+    """
     env_file = ROOT / ".env"
     if not env_file.exists():
         return
@@ -17,11 +40,25 @@ def _load_dotenv() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key.strip(), value)
+        os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
 _load_dotenv()
+
+
+def clean_child_env() -> dict:
+    """A copy of the environment safe to hand a `claude` subprocess.
+
+    Strips the markers that identify a *parent* Claude Code session. Left in,
+    the CLI the bot spawns can believe it is a nested child of whatever started
+    the bot, and inherited CLAUDE_MODEL/CLAUDE_EFFORT would fight the flags the
+    bot passes explicitly. Auth (ANTHROPIC_API_KEY, the OAuth store) is
+    untouched — only session identity and settings the bot sets itself go.
+    """
+    env = dict(os.environ)
+    for name in (*INHERITED_CLAUDE_VARS, "CLAUDE_MODEL", "CLAUDE_EFFORT"):
+        env.pop(name, None)
+    return env
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -75,6 +112,12 @@ CLAUDE_MAX_BUDGET_USD = float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "0").strip
 # Chrome running; harmless if not, you just get no browser tools.
 CLAUDE_CHROME = _bool("CLAUDE_CHROME", True)
 
+# Browser tools are the largest toolset the bot can hand Claude, and every tool
+# definition sits in the cached prefix of *every* request in a conversation —
+# paid in full on the first turn and on any cache miss. Most prompts never
+# browse, so this is opt-out per conversation via `!chrome`.
+CLAUDE_CHROME_DEFAULT_ON = _bool("CLAUDE_CHROME_DEFAULT_ON", False)
+
 # Extra tools handed to Claude via MCP — browser control lives here. Defaults to
 # mcp.json beside this file when it exists. A path that does not exist is
 # ignored rather than fatal, so the bot still runs with plain Claude.
@@ -126,6 +169,32 @@ def browser_profile_dir() -> str:
             if isinstance(arg, str) and arg.startswith("--user-data-dir="):
                 return arg.split("=", 1)[1]
     return ""
+
+
+# ------------------------------------------------------------ one browser, not two
+#
+# `--chrome` (the extension, driving the Chrome you already use) and a
+# chrome-devtools MCP server (driving an isolated profile) are two *complete*
+# and overlapping browser toolsets. Enabling both doubles the browser tool
+# definitions in every request's cached prefix and leaves Claude guessing which
+# set to reach for — the README warns about it, but nothing used to enforce it.
+#
+# An MCP browser wins when one is configured, because dropping an mcp.json next
+# to the bot is a deliberate act; otherwise the extension stands.
+
+MCP_BROWSER_PROFILE = browser_profile_dir()
+
+if MCP_BROWSER_PROFILE and CLAUDE_CHROME:
+    CLAUDE_CHROME = False
+
+
+def browser_mode() -> str:
+    """Which browser toolset Claude actually gets: 'mcp', 'chrome' or 'none'."""
+    if MCP_BROWSER_PROFILE:
+        return "mcp"
+    if CLAUDE_CHROME:
+        return "chrome"
+    return "none"
 
 
 def validate() -> list[str]:

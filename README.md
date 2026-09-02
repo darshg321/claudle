@@ -153,9 +153,11 @@ Run `!help` for the live list, or `!help <command>` for details.
 | `!convo <label>` | Switch to one. |
 | `!convo new <label> [dir]` | Start a new one, optionally in another directory. |
 | `!convo rename <a> <b>` / `!convo drop <label>` | Housekeeping. |
+| `!convo switch <label>` | Switch explicitly, for a label that reads like a subcommand. |
 | `!new` | Wipe the active conversation's history, keeping its label. |
 | `!model [alias]` | Show or set the model for this conversation. |
 | `!effort [level]` | Show or set reasoning effort for this conversation. |
+| `!chrome [on\|off]` | Show or toggle browser tools for this conversation. Off is cheaper. |
 | `!session [id]` | Show the session ID, or resume a specific one. |
 | `!window [anchor]` | 5-hour window status, or open a new one now. |
 | `!cancel` | Kill the turn in progress. |
@@ -225,7 +227,7 @@ All screen capture is limited to the primary monitor — secondary displays are 
 | `!procs [filter]` · `!kill <pid\|name> [force]` | Process list and termination. |
 | `!windows` · `!focus <title>` | List windows / bring one to the front. |
 | `!open <app\|file\|url>` | Open anything the way Explorer would. |
-| `!browser [url]` | Open Chrome on the isolated automation profile, if you use one (alias `!chrome`). |
+| `!browser [url]` | Open the Chrome that Claude browses with, to sign into sites (alias `!signin`). |
 | `!clip [text]` | Read or set the clipboard. |
 | `!vol <0-100\|up\|down\|mute>` | System volume. |
 
@@ -265,8 +267,9 @@ targets the thing you can see running.
 
 ## Browser control
 
-On by default. Claude drives **the Chrome you already use**, with the sessions
-you are already signed into, so prompts like this just work:
+Available by default, **loaded per conversation**. Claude drives **the Chrome
+you already use**, with the sessions you are already signed into, so once a
+conversation has browser tools, prompts like this just work:
 
 ```
 check my aliexpress cart and tell me what's in it
@@ -278,8 +281,26 @@ into a site in Chrome, Claude can use it.
 This is Claude Code's **Claude in Chrome** integration. The CLI talks over
 native messaging to a Chrome extension running inside your normal browser, so
 there is no remote-debugging port and nothing is copied out of your profile —
-the extension is simply already inside it. The bot passes `--chrome` on every
-turn; set `CLAUDE_CHROME=false` to turn it off.
+the extension is simply already inside it.
+
+### Turning it on for a conversation
+
+Browser tools are the largest toolset the bot can hand Claude, and every tool
+definition rides in the cached prefix of *every* request in a conversation — so
+a conversation that never browses would still pay for them on its first turn and
+on every cache miss. New conversations therefore start without them:
+
+```
+!chrome          # is this conversation carrying browser tools?
+!chrome on       # load them here
+!chrome off      # drop them again
+```
+
+`!convo` marks conversations that have them with `chrome`. Toggling mid-conversation
+invalidates that conversation's cached prefix, exactly like `!model` and
+`!effort` — the reply says so when it matters. Set
+`CLAUDE_CHROME_DEFAULT_ON=true` to have every new conversation start with them,
+or `CLAUDE_CHROME=false` to remove the option entirely.
 
 ### Setup
 
@@ -309,13 +330,22 @@ compared with driving the screen through `!click`.
 If you'd rather Claude *not* see your everyday logins, `mcp.json.example`
 configures [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 against a dedicated Chrome profile instead. Copy it to `mcp.json`, point
-`--user-data-dir` at a path you own, set `CLAUDE_CHROME=false`, and use
-`!browser` to sign into just the sites you want reachable.
+`--user-data-dir` at a path you own, and use `!browser` to sign into just the
+sites you want reachable.
 
 That route can't use your main profile: since Chrome 136, remote debugging is
 ignored on the default `--user-data-dir`, which is the fix for a real
-cookie-theft technique. Use one or the other — running both gives Claude two
-browser toolsets and it will pick badly.
+cookie-theft technique.
+
+You get one browser toolset or the other, never both — running both would double
+the browser tool definitions in every request and leave Claude guessing which
+set to reach for. **A configured `mcp.json` wins and `--chrome` is switched off
+automatically**, so you no longer have to remember to set `CLAUDE_CHROME=false`
+yourself. The startup banner prints which one is in effect:
+
+```
+[pccontrol] browser: mcp · default per conversation: off
+```
 
 ---
 
@@ -337,8 +367,15 @@ The ones worth knowing:
 | `AUTO_SCREENSHOT` | `true` | Screenshot after every successful Claude turn. |
 | `BARE_MESSAGE_IS_PROMPT` | `true` | Set `false` to require the `!claude` prefix. |
 | `CLAUDE_TIMEOUT` | `1800` | Seconds before a Claude turn is force-stopped. |
-| `CLAUDE_CHROME` | `true` | Let Claude drive your real Chrome. See [Browser control](#browser-control). |
+| `CLAUDE_CHROME` | `true` | Let Claude drive your real Chrome. Forced off when `mcp.json` supplies a browser. See [Browser control](#browser-control). |
+| `CLAUDE_CHROME_DEFAULT_ON` | `false` | Whether new conversations start with browser tools loaded. |
 | `MCP_CONFIG` | `mcp.json` beside `bot.py` | Extra MCP servers handed to Claude. |
+
+Settings in `.env` beat anything already in the environment. That matters
+because the bot is often launched *from* a Claude Code session, and such a
+session exports `CLAUDE_EFFORT` and friends — without this, a bot started from
+one would silently bill every prompt at that session's effort level instead of
+its own.
 
 ---
 
@@ -380,10 +417,17 @@ The other levers, roughly in order of effect:
   bot nudges you at 40 turns.
 - **Match effort to the task.** `CLAUDE_EFFORT` and `!effort` control thinking
   tokens, which bill as output. `high` on every "what's in this folder" is real
-  money.
-- **Don't switch model or effort mid-conversation.** Both are part of the cache
-  key, so a switch re-reads the whole history. `!model` and `!effort` warn when
-  the active conversation already has a session.
+  money. The shipped default is `medium`.
+- **Only load the tools you need.** Tool definitions sit at the very front of the
+  cached prefix, so every conversation pays for them on its first turn and on
+  every cache miss. Browser tools are the big one, and they stay off until
+  `!chrome on` asks for them. Two browser toolsets are never loaded at once.
+- **Don't switch model, effort or toolset mid-conversation.** All three are part
+  of the cache key, so a switch re-reads the whole history. `!model`, `!effort`
+  and `!chrome` warn when the active conversation already has a session.
+- **Cap the runaway case.** `CLAUDE_MAX_BUDGET_USD` stops a turn that has lost
+  the plot. With a long `CLAUDE_TIMEOUT` it is the only ceiling between an
+  agentic loop and a whole 5-hour window.
 - **Watch the footer.** Every turn reports its cache hit rate, and flags a turn
   that re-cached more than 20k tokens on a resume — that is the symptom of a
   prefix that moved.

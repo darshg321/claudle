@@ -91,11 +91,15 @@ class ClaudeSession:
         session_id: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        chrome: bool = False,
     ):
         self.cwd = cwd
         self.session_id = session_id
         self.model = model or config.CLAUDE_MODEL
         self.effort = effort or config.CLAUDE_EFFORT
+        # Browser tools are only ever offered through one channel; the caller has
+        # already reconciled `--chrome` against any MCP browser server.
+        self.chrome = chrome
         self._process: asyncio.subprocess.Process | None = None
 
     @property
@@ -123,7 +127,7 @@ class ClaudeSession:
         ]
         if config.CLAUDE_PERMISSION_MODE == "bypassPermissions":
             args.append("--dangerously-skip-permissions")
-        args.append("--chrome" if config.CLAUDE_CHROME else "--no-chrome")
+        args.append("--chrome" if self.chrome else "--no-chrome")
         if config.CLAUDE_STABLE_PREFIX:
             args.append("--exclude-dynamic-system-prompt-sections")
         if config.MCP_CONFIG:
@@ -151,6 +155,7 @@ class ClaudeSession:
                 exe,
                 *args,
                 cwd=self.cwd,
+                env=config.clean_child_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

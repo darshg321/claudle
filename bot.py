@@ -45,7 +45,25 @@ class Command:
 
 
 def command(name: str, usage: str, help_text: str, group: str, aliases: tuple[str, ...] = ()):
+    """Register a command, refusing any name or alias that is already spoken for.
+
+    on_message resolves aliases *before* command names, so an alias that happens
+    to equal another command's name silently swallows it — `!chrome` once
+    resolved to `!browser` and the real `!chrome` was unreachable. Failing loudly
+    at import turns that into a crash on the next `!relaunch`, which is caught by
+    the compile check, instead of a command that quietly does the wrong thing.
+    """
+
     def decorator(func: Callable[["Ctx"], Awaitable[None]]):
+        if name in COMMANDS:
+            raise ValueError(f"duplicate command name: {name!r}")
+        if name in ALIASES:
+            raise ValueError(f"command {name!r} is already an alias of {ALIASES[name]!r}")
+        for alias in aliases:
+            if alias in COMMANDS:
+                raise ValueError(f"alias {alias!r} of {name!r} shadows the {alias!r} command")
+            if alias in ALIASES:
+                raise ValueError(f"alias {alias!r} is already claimed by {ALIASES[alias]!r}")
         COMMANDS[name] = Command(name, func, usage, help_text, group, aliases)
         for alias in aliases:
             ALIASES[alias] = name
@@ -68,6 +86,13 @@ class ChannelState:
         # One live ClaudeSession per label. These are long-lived because
         # `!cancel` needs the object that owns the running subprocess.
         self._sessions: dict[str, claude_runner.ClaudeSession] = {}
+        # The session that owns the subprocess right now. Held separately
+        # because `!convo` can move `current` mid-run, and cancelling the
+        # *newly active* session would leave the real one running headless.
+        self.running: claude_runner.ClaudeSession | None = None
+        # Last channel object seen for this ID, so the tray can report a kill
+        # without depending on discord.py's channel cache holding the DM.
+        self.channel: discord.abc.Messageable | None = None
 
     @property
     def convo(self) -> convos.Convo:
@@ -89,7 +114,11 @@ class ChannelState:
         session = self._sessions.get(convo.label)
         if session is None:
             session = claude_runner.ClaudeSession(
-                convo.cwd, convo.session_id, convo.model, convo.effort
+                convo.cwd,
+                convo.session_id,
+                convo.model,
+                convo.effort,
+                chrome=convo.chrome and config.browser_mode() == "chrome",
             )
             self._sessions[convo.label] = session
         return session
@@ -99,6 +128,7 @@ class ChannelState:
         convo = self.convo
         convo.session_id = None
         convo.turns = 0
+        convo.warned_busy = False
         self._sessions.pop(convo.label, None)
 
     def sync(self) -> None:
@@ -117,17 +147,24 @@ CONVOS: dict[int, convos.ChannelConvos] = {}
 UI = ui.DesktopUI()
 
 # Set once the client is up, so the tray and HUD threads can hop onto the
-# asyncio loop. ACTIVE_CTX is whichever channel currently owns a Claude turn —
-# the tray's "Kill current task" and the HUD's Kill button act on it.
+# asyncio loop. The tray's "Kill current task" and the HUD's Kill button walk
+# STATES for whatever is running rather than tracking a single global, which
+# used to lose track of the real task whenever two channels overlapped.
 LOOP: asyncio.AbstractEventLoop | None = None
-ACTIVE_CTX: "Ctx | None" = None
 WINDOW_TASK: asyncio.Task | None = None
+
+# sessions.json is read exactly once. Keying off "is CONVOS still empty" meant
+# the first channel to appear populated it, so every *later* channel silently
+# skipped the load and started from scratch on top of its own saved history.
+_CONVOS_LOADED = False
 
 
 def state_for(channel_id: int) -> ChannelState:
+    global _CONVOS_LOADED
+    if not _CONVOS_LOADED:
+        CONVOS.update(convos.load())
+        _CONVOS_LOADED = True
     if channel_id not in STATES:
-        if not CONVOS:
-            CONVOS.update(convos.load())
         store = CONVOS.get(channel_id)
         if store is None:
             store = convos.ChannelConvos(config.DEFAULT_WORKDIR)
@@ -155,6 +192,7 @@ class Ctx:
         self.name = name
         self.rest = rest.strip()
         self.state = state_for(message.channel.id)
+        self.state.channel = message.channel
 
     @property
     def args(self) -> list[str]:
@@ -332,13 +370,11 @@ async def cmd_claude(ctx: Ctx) -> None:
 
 async def _drive_claude(ctx: Ctx, prompt: str) -> None:
     """Own the desktop UI for the length of one turn, then always release it."""
-    global ACTIVE_CTX
-    ACTIVE_CTX = ctx
     UI.task_started(Path(ctx.state.cwd).name or ctx.state.cwd)
     try:
         await _run_claude_turn(ctx, prompt)
     finally:
-        ACTIVE_CTX = None
+        ctx.state.running = None
         UI.task_finished("idle")
 
 
@@ -346,6 +382,7 @@ async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
     convo = ctx.state.convo
     session = ctx.state.session
     session.cwd = ctx.state.cwd
+    ctx.state.running = session
     resuming = bool(session.session_id)
 
     header = (
@@ -427,7 +464,11 @@ async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
     status.replace_header(f"{header}\n{icon} done · {' · '.join(footer_bits) or 'no stats'}")
     await status.flush(force=True)
 
-    if convo.turns == convos.BUSY_TURNS:
+    # `==` missed the nudge entirely whenever a turn count jumped the boundary
+    # (a resumed session, an imported ID); the flag also keeps it to once.
+    if convo.turns >= convos.BUSY_TURNS and not convo.warned_busy:
+        convo.warned_busy = True
+        save_sessions()
         await ctx.send(
             f"📊 `{convo.label}` has hit {convo.turns} turns. Every prompt now re-sends "
             f"all of it. If you have moved on to something else, `{config.PREFIX}convo new <label>` "
@@ -518,7 +559,8 @@ async def cmd_cancel(ctx: Ctx) -> None:
     task = ctx.state.claude_task
     if task and not task.done():
         task.cancel()
-        await ctx.state.session.cancel()
+        # The session that owns the subprocess, not whichever one is active now.
+        await (ctx.state.running or ctx.state.session).cancel()
         await ctx.ok("Cancelled the running Claude turn.")
     else:
         await ctx.fail("Nothing is running here.")
@@ -533,7 +575,7 @@ async def cmd_new(ctx: Ctx) -> None:
 
 @command(
     "convo",
-    "!convo [<label> | new <label> [dir] | rename <a> <b> | drop <label>]",
+    "!convo [<label> | new <label> [dir] | switch <label> | rename <a> <b> | drop <label>]",
     "List, create and switch between named conversations.",
     "Claude Code",
     aliases=("chat", "convos"),  # not "c" — that is already !claude
@@ -543,7 +585,7 @@ async def cmd_convo(ctx: Ctx) -> None:
     parts = ctx.args
     p = config.PREFIX
 
-    if not parts:
+    if not parts or (parts[0].lower() == "list" and "list" not in store.convos):
         await ctx.long(store.listing(), lang="")
         await ctx.send(f"_`{p}convo new <label>` to start one · `{p}convo <label>` to switch_")
         return
@@ -553,11 +595,22 @@ async def cmd_convo(ctx: Ctx) -> None:
 
     if verb in ("new", "add"):
         if not rest:
-            await ctx.fail(f"Name it: `{p}convo new refactor`")
+            # A pre-existing conversation may still carry a now-reserved name.
+            hint = (
+                f"\n_You already have one called `{verb}` — `{p}convo switch {verb}` reaches it, "
+                f"`{p}convo rename {verb} <newname>` gets it out of the way._"
+                if verb in store.convos
+                else ""
+            )
+            await ctx.fail(f"Name it: `{p}convo new refactor`{hint}")
             return
         label = rest[0]
         if not convos.valid_label(label):
-            await ctx.fail("Labels are 1-32 chars: letters, digits, `.`, `_`, `-`.")
+            await ctx.fail(
+                "Labels are 1-32 chars — letters, digits, `.`, `_`, `-` — and cannot be "
+                f"one of: {', '.join(f'`{w}`' for w in sorted(convos.RESERVED))} "
+                "(those are `!convo` subcommands)."
+            )
             return
         if label in store.convos:
             await ctx.fail(f"`{label}` already exists — `{p}convo {label}` switches to it.")
@@ -585,7 +638,10 @@ async def cmd_convo(ctx: Ctx) -> None:
             await ctx.fail(f"Usage: `{p}convo rename old new`")
             return
         if not convos.valid_label(rest[1]):
-            await ctx.fail("Labels are 1-32 chars: letters, digits, `.`, `_`, `-`.")
+            await ctx.fail(
+                "Labels are 1-32 chars — letters, digits, `.`, `_`, `-` — and cannot be "
+                f"one of: {', '.join(f'`{w}`' for w in sorted(convos.RESERVED))}."
+            )
             return
         if not store.rename(rest[0], rest[1]):
             await ctx.fail(f"Could not rename `{rest[0]}` → `{rest[1]}`.")
@@ -700,6 +756,64 @@ async def cmd_effort(ctx: Ctx) -> None:
             f"`{convo.label}` re-reads its history uncached."
         )
     await ctx.ok(f"`{convo.label}` now runs at `{choice}` effort.{note}")
+
+
+@command(
+    "chrome",
+    "!chrome [on|off]",
+    "Show or toggle browser tools for the active conversation (off is cheaper).",
+    "Claude Code",
+    aliases=("browsertools",),
+)
+async def cmd_chrome(ctx: Ctx) -> None:
+    convo = ctx.state.convo
+    p = config.PREFIX
+    mode = config.browser_mode()
+
+    if mode == "mcp":
+        await ctx.send(
+            f"Browser tools come from the MCP server in `{config.MCP_CONFIG}`, which is "
+            f"always loaded. `{p}chrome` only controls Claude in Chrome — remove "
+            f"`mcp.json` to switch back to it."
+        )
+        return
+    if not config.CLAUDE_CHROME:
+        await ctx.send("Claude in Chrome is off globally (`CLAUDE_CHROME=false` in `.env`).")
+        return
+
+    if not ctx.rest:
+        await ctx.send(
+            f"**Browser tools:** `{'on' if convo.chrome else 'off'}` in `{convo.label}`\n"
+            f"_Every browser tool definition rides in this conversation's cached prefix, "
+            f"so leaving it off keeps non-browsing prompts smaller. "
+            f"`{p}chrome on` when you need Claude to actually open a page._"
+        )
+        return
+
+    choice = ctx.rest.strip().lower()
+    if choice not in ("on", "off", "true", "false", "1", "0", "yes", "no"):
+        await ctx.fail(f"Usage: `{p}chrome on` or `{p}chrome off`")
+        return
+    wanted = choice in ("on", "true", "1", "yes")
+
+    if wanted == convo.chrome:
+        await ctx.ok(f"Browser tools are already `{'on' if wanted else 'off'}` here.")
+        return
+
+    convo.chrome = wanted
+    ctx.state._sessions.pop(convo.label, None)
+    save_sessions()
+
+    note = ""
+    if convo.session_id:
+        # Tool definitions sit at the very front of the cached prefix, so
+        # changing the toolset invalidates the whole conversation — same cost
+        # shape as switching model or effort.
+        note = (
+            f"\n⚠️ The toolset is part of the cached prefix, so the next prompt in "
+            f"`{convo.label}` re-reads its history uncached. `{p}convo new` avoids that."
+        )
+    await ctx.ok(f"Browser tools `{'on' if wanted else 'off'}` in `{convo.label}`.{note}")
 
 
 @command("session", "!session [id]", "Show the Claude session ID, or resume a specific one.", "Claude Code", aliases=("resume",))
@@ -820,10 +934,11 @@ async def cmd_relaunch(ctx: Ctx) -> None:
     # Refuse to restart into a file that will not import — a syntax error here
     # takes the bot off Discord with no way to fix it remotely.
     entry = Path(config.SELF_DIR) / "startup.pyw"
+    # Globbed, not listed: a hand-maintained list silently stops covering any
+    # module Claude adds to the package while editing itself.
+    sources = sorted(p.name for p in Path(config.SELF_DIR).glob("*.py"))
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "py_compile", "bot.py", "config.py",
-        "claude_runner.py", "convos.py", "window.py", "usage.py", "ui.py",
-        "screen.py", "sysctl.py",
+        sys.executable, "-m", "py_compile", *sources,
         cwd=config.SELF_DIR,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -1198,22 +1313,34 @@ async def cmd_open(ctx: Ctx) -> None:
     "!browser [url]",
     "Open Chrome on the profile Claude browses with, so you can sign into sites.",
     "System",
-    aliases=("chrome",),
+    # No `chrome` alias: `!chrome` is the browser-tools toggle. One word, two
+    # very different jobs, and the alias silently won.
+    aliases=("signin",),
 )
 async def cmd_browser(ctx: Ctx) -> None:
-    profile = config.browser_profile_dir()
-    if not profile:
+    mode = config.browser_mode()
+    if mode == "none":
         await ctx.fail(
-            "No browser profile configured. Copy `mcp.json.example` to `mcp.json`, "
-            "set `--user-data-dir=`, and restart the bot."
+            "No browser toolset is active. Either set `CLAUDE_CHROME=true` in `.env` "
+            "(Claude drives your normal Chrome), or copy `mcp.json.example` to "
+            "`mcp.json` for an isolated profile. Restart the bot after either."
         )
         return
+
+    # In `chrome` mode Claude works through the extension in the browser you
+    # already use, so there is no separate profile to open — an empty profile
+    # dir means "your normal Chrome".
+    profile = config.MCP_BROWSER_PROFILE if mode == "mcp" else ""
     try:
         note = await asyncio.to_thread(sysctl.launch_browser, profile, ctx.rest)
     except FileNotFoundError as exc:
         await ctx.fail(str(exc))
         return
-    await ctx.ok(f"{note}\nSign in here and Claude keeps the session. Close it before browsing.")
+
+    if mode == "mcp":
+        await ctx.ok(f"{note}\nSign in here and Claude keeps the session. Close it before browsing.")
+    else:
+        await ctx.ok(f"{note}\nThis is the Chrome the extension drives — Claude sees these logins.")
 
 
 @command("clip", "!clip [text]", "Read the clipboard, or set it.", "System", aliases=("clipboard",))
@@ -1305,12 +1432,30 @@ async def cmd_help(ctx: Ctx) -> None:
         ),
         colour=0xD97757,
     )
-    for group in ("Claude Code", "Self", "Shell", "Screen", "Input", "Files", "System", "Power", "Meta"):
+    ordered = ("Claude Code", "Self", "Shell", "Screen", "Input", "Files", "System", "Power", "Meta")
+    # Any group not in `ordered` would otherwise vanish from !help entirely.
+    for group in (*ordered, *sorted(set(groups) - set(ordered))):
         cmds = groups.get(group)
         if not cmds:
             continue
-        body = "\n".join(f"`{c.usage.replace('!', p, 1)}` — {c.help}" for c in sorted(cmds, key=lambda c: c.name))
-        embed.add_field(name=group, value=body[:1024], inline=False)
+        rows = [f"`{c.usage.replace('!', p, 1)}` — {c.help}" for c in sorted(cmds, key=lambda c: c.name)]
+        # Discord caps a field at 1024 characters. The Claude Code group was
+        # already at 881, so the next command added to it would have been
+        # silently cut off the bottom of the list; spill into a second field
+        # instead of losing rows.
+        chunk: list[str] = []
+        size = 0
+        part = 0
+        for row in rows:
+            if chunk and size + len(row) + 1 > 1024:
+                part += 1
+                embed.add_field(name=group if part == 1 else f"{group} (cont.)", value="\n".join(chunk), inline=False)
+                chunk, size = [], 0
+            chunk.append(row)
+            size += len(row) + 1
+        if chunk:
+            part += 1
+            embed.add_field(name=group if part == 1 else f"{group} (cont.)", value="\n".join(chunk), inline=False)
     await ctx.channel.send(embed=embed)
 
 
@@ -1332,6 +1477,10 @@ async def on_ready() -> None:
     print(f"[pccontrol] default working directory: {config.DEFAULT_WORKDIR}")
     print(f"[pccontrol] model: {config.CLAUDE_MODEL or 'account default'} · effort: {config.CLAUDE_EFFORT}")
     print(f"[pccontrol] stable cache prefix: {config.CLAUDE_STABLE_PREFIX}")
+    print(
+        f"[pccontrol] browser: {config.browser_mode()}"
+        f" · default per conversation: {'on' if config.CLAUDE_CHROME_DEFAULT_ON else 'off'}"
+    )
 
     owner = None
     try:
@@ -1403,16 +1552,20 @@ async def on_message(message: discord.Message) -> None:
 
 
 async def _kill_active(reason: str) -> None:
-    """Stop the running Claude turn, whichever channel started it."""
-    ctx = ACTIVE_CTX
-    if ctx is None or ctx.state.claude_task is None or ctx.state.claude_task.done():
-        return
-    ctx.state.claude_task.cancel()
-    await ctx.state.session.cancel()
-    try:
-        await ctx.send(f"🛑 Killed from {reason}.")
-    except discord.HTTPException:
-        pass
+    """Stop every running Claude turn, in whichever channel started it."""
+    for state in list(STATES.values()):
+        task = state.claude_task
+        if task is None or task.done():
+            continue
+        task.cancel()
+        session = state.running or state.session
+        await session.cancel()
+        if state.channel is None:
+            continue
+        try:
+            await state.channel.send(f"🛑 Killed from {reason}.")
+        except discord.HTTPException:
+            pass
 
 
 async def _shutdown() -> None:

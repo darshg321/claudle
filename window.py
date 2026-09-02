@@ -91,6 +91,7 @@ def anchor(model: str | None = None) -> dict:
         argv,
         capture_output=True,
         timeout=180,
+        env=config.clean_child_env(),
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     try:

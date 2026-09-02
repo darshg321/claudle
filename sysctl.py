@@ -295,11 +295,12 @@ CHROME_CANDIDATES = (
 )
 
 
-def launch_browser(profile_dir: str, url: str = "") -> str:
-    """Open Chrome on the automation profile so the owner can sign into sites.
+def launch_browser(profile_dir: str = "", url: str = "") -> str:
+    """Open Chrome so the owner can sign into the sites Claude will browse.
 
-    Deliberately the same --user-data-dir the MCP server uses: cookies set here
-    are the cookies Claude will browse with later.
+    With a profile dir, that is deliberately the same --user-data-dir the MCP
+    server uses: cookies set there are the cookies Claude browses with. Empty
+    means the normal Chrome, which is what the Claude in Chrome extension drives.
     """
     exe = shutil.which("chrome")
     if not exe:
@@ -311,11 +312,15 @@ def launch_browser(profile_dir: str, url: str = "") -> str:
     if not exe:
         raise FileNotFoundError("Could not find chrome.exe — install Chrome or add it to PATH.")
 
-    args = [exe, f"--user-data-dir={profile_dir}", "--no-first-run", "--no-default-browser-check"]
+    args = [exe]
+    if profile_dir:
+        args += [f"--user-data-dir={profile_dir}", "--no-first-run", "--no-default-browser-check"]
     if url:
         args.append(url)
     subprocess.Popen(args, creationflags=subprocess.CREATE_NO_WINDOW)
-    return f"opened Chrome on the automation profile ({profile_dir})"
+    if profile_dir:
+        return f"opened Chrome on the automation profile ({profile_dir})"
+    return "opened your normal Chrome"
 
 
 def list_windows() -> list[str]:
