@@ -9,6 +9,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -378,8 +379,36 @@ async def _drive_claude(ctx: Ctx, prompt: str) -> None:
         UI.task_finished("idle")
 
 
+# Keywords/patterns that mean a prompt almost certainly needs a browser, so
+# browser tools can turn on by themselves instead of requiring `!chrome on`
+# typed by hand first. False positives just cost one extra cache-write on a
+# turn that happens not to use the tools; false negatives fall back to the
+# manual toggle, same as before this existed.
+_BROWSER_HINTS = re.compile(
+    r"\b(gmail|e-?mail|inbox|compose|amazon|cart|checkout|browser|website|web ?page|"
+    r"log ?in|sign ?in|navigate to|open (?:chrome|a tab)|click on|"
+    r"add .{0,40}to (?:the |my )?cart|order (?:a|an|some|me)|buy (?:a|an|some|me)|"
+    r"google (?:doc|sheet|drive|calendar)|https?://|www\.)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_browser(prompt: str) -> bool:
+    return bool(_BROWSER_HINTS.search(prompt))
+
+
 async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
     convo = ctx.state.convo
+    auto_chrome_note = ""
+    if config.browser_mode() == "chrome" and not convo.chrome and _wants_browser(prompt):
+        convo.chrome = True
+        existing = ctx.state._sessions.get(convo.label)
+        if existing is not None:
+            existing.chrome = True
+        save_sessions()
+        p = config.PREFIX
+        auto_chrome_note = f"\n🌐 auto-enabled browser tools for this task (`{p}chrome off` to force off)"
+
     session = ctx.state.session
     session.cwd = ctx.state.cwd
     ctx.state.running = session
@@ -387,7 +416,7 @@ async def _run_claude_turn(ctx: Ctx, prompt: str) -> None:
 
     header = (
         f"🧠 **Claude Code** · `{convo.label}` · `{ctx.state.cwd}`\n"
-        f"{'↩️ resuming session' if resuming else '🆕 new session'}"
+        f"{'↩️ resuming session' if resuming else '🆕 new session'}{auto_chrome_note}"
     )
     status = LiveStatus(await ctx.send(f"{header}\n⏳ starting…"), header)
     texts: list[str] = []
@@ -721,7 +750,7 @@ async def cmd_model(ctx: Ctx) -> None:
 
 @command(
     "effort",
-    "!effort [low|medium|high|xhigh|max]",
+    "!effort [low|medium|high|xhigh|max|auto]",
     "Show or change reasoning effort for the active conversation.",
     "Claude Code",
 )
@@ -729,20 +758,24 @@ async def cmd_effort(ctx: Ctx) -> None:
     convo = ctx.state.convo
     p = config.PREFIX
     if not ctx.rest:
+        current = convo.effort or config.CLAUDE_EFFORT or "auto"
         await ctx.send(
-            f"**Effort:** `{convo.effort or config.CLAUDE_EFFORT}` in `{convo.label}`\n"
-            f"Options: {', '.join(f'`{e}`' for e in config.EFFORTS)}\n"
-            f"_Effort drives thinking tokens, which bill as output. `medium` suits "
+            f"**Effort:** `{current}` in `{convo.label}`\n"
+            f"Options: {', '.join(f'`{e}`' for e in config.EFFORTS)}, or `auto` "
+            f"(no --effort flag — Claude Code decides per turn).\n"
+            f"_Effort drives thinking tokens, which bill as output. `auto` suits "
             f"most chat prompts; raise it for hard multi-step work._"
         )
         return
 
     choice = ctx.rest.strip().lower()
-    if choice not in config.EFFORTS:
-        await ctx.fail(f"Pick one of: {', '.join(config.EFFORTS)}")
+    if choice in ("auto", "default", "clear", "reset"):
+        choice = ""
+    elif choice not in config.EFFORTS:
+        await ctx.fail(f"Pick one of: {', '.join(config.EFFORTS)}, or `auto`")
         return
     if choice == (convo.effort or config.CLAUDE_EFFORT):
-        await ctx.ok(f"Already on `{choice}`.")
+        await ctx.ok(f"Already on `{choice or 'auto'}`.")
         return
 
     convo.effort = choice
@@ -755,7 +788,7 @@ async def cmd_effort(ctx: Ctx) -> None:
             f"\n⚠️ Effort is part of the cache key too — the next prompt in "
             f"`{convo.label}` re-reads its history uncached."
         )
-    await ctx.ok(f"`{convo.label}` now runs at `{choice}` effort.{note}")
+    await ctx.ok(f"`{convo.label}` now runs at `{choice or 'auto'}` effort.{note}")
 
 
 @command(
@@ -1475,12 +1508,13 @@ async def on_ready() -> None:
     print(f"[pccontrol] logged in as {client.user} (id {client.user.id})")
     print(f"[pccontrol] owner: {config.OWNER_ID} · prefix: {config.PREFIX}")
     print(f"[pccontrol] default working directory: {config.DEFAULT_WORKDIR}")
-    print(f"[pccontrol] model: {config.CLAUDE_MODEL or 'account default'} · effort: {config.CLAUDE_EFFORT}")
+    print(f"[pccontrol] model: {config.CLAUDE_MODEL or 'account default'} · effort: {config.CLAUDE_EFFORT or 'auto'}")
     print(f"[pccontrol] stable cache prefix: {config.CLAUDE_STABLE_PREFIX}")
     print(
         f"[pccontrol] browser: {config.browser_mode()}"
-        f" · default per conversation: {'on' if config.CLAUDE_CHROME_DEFAULT_ON else 'off'}"
+        f" · default per conversation: {'on' if config.CLAUDE_CHROME_DEFAULT_ON else 'auto-detect'}"
     )
+    print(f"[pccontrol] autopilot (act without asking to confirm): {config.CLAUDE_AUTOPILOT}")
 
     owner = None
     try:

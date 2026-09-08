@@ -132,6 +132,7 @@ async def watch(notify) -> None:
     """
     state = _load_state()
     last_resets_at = state.get("resets_at")
+    last_resets_dt = _parse(last_resets_at)
     announced = state.get("announced_at")
 
     while True:
@@ -147,9 +148,18 @@ async def watch(notify) -> None:
             continue
 
         current = now["resets_at"]
+        current_dt = now["resets_dt"]
+        now_utc = datetime.now(timezone.utc)
+
+        # A window has only actually rolled over once the boundary we already
+        # knew about has passed. Comparing `resets_at` as a string here used to
+        # be the whole check, but Anthropic's usage endpoint recomputes it
+        # fresh on every call — two polls a moment apart can differ by tens of
+        # milliseconds with nothing having changed, which read as "a new
+        # window" and fired a false reset DM plus a real anchor probe.
         rolled = (
-            last_resets_at is not None
-            and current != last_resets_at
+            last_resets_dt is not None
+            and last_resets_dt <= now_utc
             and announced != last_resets_at
         )
 
@@ -171,18 +181,20 @@ async def watch(notify) -> None:
                     )
                     lines.append(describe(fresh))
                     current = fresh["resets_at"]
+                    current_dt = fresh["resets_dt"]
                 except Exception as exc:
                     lines.append(f"⚠️ Could not anchor the new window: {exc}")
 
             await notify("\n".join(lines))
 
         last_resets_at = current
+        last_resets_dt = current_dt
         _save_state({"resets_at": current, "announced_at": announced})
 
         # Poll harder as the reset approaches so the DM lands close to the event.
         delay = config.WINDOW_POLL_SECONDS
-        if now["resets_dt"]:
-            seconds = (now["resets_dt"] - datetime.now(timezone.utc)).total_seconds()
+        if current_dt:
+            seconds = (current_dt - now_utc).total_seconds()
             if 0 < seconds < 600:
                 delay = 30
         await asyncio.sleep(delay)

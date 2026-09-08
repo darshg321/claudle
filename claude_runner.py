@@ -130,6 +130,8 @@ class ClaudeSession:
         args.append("--chrome" if self.chrome else "--no-chrome")
         if config.CLAUDE_STABLE_PREFIX:
             args.append("--exclude-dynamic-system-prompt-sections")
+        if config.CLAUDE_AUTOPILOT and config.CLAUDE_AUTOPILOT_PROMPT:
+            args += ["--append-system-prompt", config.CLAUDE_AUTOPILOT_PROMPT]
         if config.MCP_CONFIG:
             args += ["--mcp-config", config.MCP_CONFIG]
         if self.model:

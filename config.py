@@ -80,11 +80,11 @@ DEFAULT_WORKDIR = os.environ.get("DEFAULT_WORKDIR", "").strip() or str(Path.home
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions").strip()
 
-# Claude Code's own default is xhigh, tuned for long autonomous coding runs.
-# Most messages sent to a chat bot are not that, and effort drives thinking
-# tokens, which bill as output. `medium` is the better default here; !effort
-# raises it per conversation when a task actually needs it.
-CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip() or "medium"
+# Blank means "auto": no --effort flag is passed at all, so Claude Code picks
+# per turn instead of a fixed level. `!effort <level>` raises it per
+# conversation when a task actually needs sustained thinking; `!effort auto`
+# clears the override back to this.
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()
 CLAUDE_TIMEOUT = _int("CLAUDE_TIMEOUT", 1800)
 
 # Models offered by `!model`. Aliases resolve to the newest model in the family,
@@ -115,8 +115,32 @@ CLAUDE_CHROME = _bool("CLAUDE_CHROME", True)
 # Browser tools are the largest toolset the bot can hand Claude, and every tool
 # definition sits in the cached prefix of *every* request in a conversation —
 # paid in full on the first turn and on any cache miss. Most prompts never
-# browse, so this is opt-out per conversation via `!chrome`.
+# browse, so this is opt-out per conversation via `!chrome`. `bot._wants_browser`
+# auto-flips it on for a turn whose prompt looks like a browser task, so this
+# stays off without needing `!chrome on` typed by hand first.
 CLAUDE_CHROME_DEFAULT_ON = _bool("CLAUDE_CHROME_DEFAULT_ON", False)
+
+# This bot only ever takes prompts from its one hard-locked owner (OWNER_ID).
+# When Claude has a tool that can act on the owner's own accounts — Claude in
+# Chrome, already signed into the owner's Chrome, or any other tool running
+# under bypassPermissions — the owner's request *is* the authorization to carry
+# it out, not a request to pause and ask permission a second time. Without this
+# nudge Claude's own judgment sometimes stops short of consequential actions
+# (sending an email, finishing a checkout) to check in first, which is exactly
+# the "offload the task back to me" friction this exists to remove.
+CLAUDE_AUTOPILOT = _bool("CLAUDE_AUTOPILOT", True)
+CLAUDE_AUTOPILOT_PROMPT = os.environ.get("CLAUDE_AUTOPILOT_PROMPT", "").strip() or (
+    "You are operating as an authorized automation agent for your sole owner, "
+    "who is also the only person who can ever message you. When they ask you "
+    "to complete a real-world action through a tool you have (sending an "
+    "email, submitting a form, adding an item to a cart, completing a "
+    "purchase via Claude in Chrome on their already-signed-in browser, or "
+    "anything similar), carry it out yourself, end to end, instead of "
+    "stopping to ask whether you should actually do it. The request is the "
+    "authorization. Only pause to check in when the action goes beyond what "
+    "was asked (an unusually large purchase, deleting irreplaceable data) or "
+    "the request is genuinely ambiguous about what to do."
+)
 
 # Extra tools handed to Claude via MCP — browser control lives here. Defaults to
 # mcp.json beside this file when it exists. A path that does not exist is
