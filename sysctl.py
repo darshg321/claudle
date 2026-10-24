@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 
 import psutil
 
+import config
+
 _pyautogui = None
 
 
@@ -209,20 +211,35 @@ def _tap(vk: int) -> None:
     time.sleep(0.005)
 
 
+def _pactl(*args: str) -> None:
+    """Linux: drive the default PulseAudio/PipeWire sink directly."""
+    subprocess.run(["pactl", *args], check=True, capture_output=True)
+
+
 def volume_mute_toggle() -> None:
+    if not config.IS_WINDOWS:
+        _pactl("set-sink-mute", "@DEFAULT_SINK@", "toggle")
+        return
     _tap(_VK_VOLUME_MUTE)
 
 
 def volume_step(steps: int) -> None:
-    """Each step is roughly 2% on Windows."""
+    """Each step is roughly 2% on Windows; exactly 2% on Linux to match."""
+    steps = max(-50, min(steps, 50))
+    if not config.IS_WINDOWS:
+        _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{steps * 2:+d}%")
+        return
     vk = _VK_VOLUME_UP if steps > 0 else _VK_VOLUME_DOWN
-    for _ in range(min(abs(steps), 50)):
+    for _ in range(abs(steps)):
         _tap(vk)
 
 
 def volume_set(percent: int) -> int:
     """Absolute level by driving the volume keys down to zero and back up."""
     percent = max(0, min(100, percent))
+    if not config.IS_WINDOWS:
+        _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{percent}%")
+        return percent
     for _ in range(50):
         _tap(_VK_VOLUME_DOWN)
     for _ in range(round(percent / 2)):
@@ -234,28 +251,49 @@ def volume_set(percent: int) -> int:
 
 
 def lock_workstation() -> None:
+    if not config.IS_WINDOWS:
+        subprocess.run(["loginctl", "lock-session"], check=True)
+        return
     ctypes.windll.user32.LockWorkStation()
 
 
 def sleep_pc() -> None:
+    if not config.IS_WINDOWS:
+        subprocess.Popen(["systemctl", "suspend"])
+        return
     subprocess.Popen(
         ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
 
+def _schedule_power(flag: str, delay_seconds: int) -> int:
+    """Run `shutdown` with a delay; returns the delay actually scheduled.
+
+    Linux `shutdown` only takes whole minutes, so the delay rounds up to one.
+    """
+    if config.IS_WINDOWS:
+        subprocess.run(["shutdown", f"/{flag}", "/t", str(delay_seconds)], check=True)
+        return delay_seconds
+    minutes = max(1, -(-delay_seconds // 60)) if delay_seconds else 0
+    linux_flag = {"s": "-P", "r": "-r"}[flag]
+    subprocess.run(["shutdown", linux_flag, f"+{minutes}"], check=True, capture_output=True)
+    return minutes * 60
+
+
 def shutdown(delay_seconds: int = 60) -> str:
-    subprocess.run(["shutdown", "/s", "/t", str(delay_seconds)], check=True)
+    delay_seconds = _schedule_power("s", delay_seconds)
     return f"shutdown scheduled in {delay_seconds}s — `{'!'}abort` cancels it"
 
 
 def reboot(delay_seconds: int = 60) -> str:
-    subprocess.run(["shutdown", "/r", "/t", str(delay_seconds)], check=True)
+    delay_seconds = _schedule_power("r", delay_seconds)
     return f"reboot scheduled in {delay_seconds}s"
 
 
 def abort_shutdown() -> str:
-    result = subprocess.run(["shutdown", "/a"], capture_output=True, text=True)
+    flag = "/a" if config.IS_WINDOWS else "-c"
+    result = subprocess.run(["shutdown", flag], capture_output=True, text=True)
     if result.returncode == 0:
         return "pending shutdown cancelled"
     return (result.stderr or result.stdout or "nothing to cancel").strip()
@@ -264,10 +302,22 @@ def abort_shutdown() -> str:
 # ----------------------------------------------------------------------------- misc
 
 
+def _startfile(target: str) -> None:
+    if config.IS_WINDOWS:
+        os.startfile(target)
+    else:
+        subprocess.Popen(
+            ["xdg-open", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
 def open_target(target: str, cwd: str | None = None) -> str:
     """Open a URL, file, folder or application the way Explorer would."""
     if target.startswith(("http://", "https://", "mailto:")):
-        os.startfile(target)
+        _startfile(target)
         return f"opened URL {target}"
 
     candidate = os.path.expandvars(os.path.expanduser(target))
@@ -275,13 +325,17 @@ def open_target(target: str, cwd: str | None = None) -> str:
         candidate = os.path.join(cwd, candidate)
 
     if os.path.exists(candidate):
-        os.startfile(candidate)
+        _startfile(candidate)
         return f"opened {candidate}"
 
     resolved = shutil.which(target)
     if resolved:
-        subprocess.Popen([resolved], creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.Popen([resolved], creationflags=config.NO_WINDOW, start_new_session=True)
         return f"launched {resolved}"
+
+    if not config.IS_WINDOWS:
+        _startfile(target)
+        return f"asked xdg-open to start {target}"
 
     # Last resort: let the shell resolve it (handles `notepad`, `calc`, ms-settings:, ...)
     subprocess.Popen(["cmd.exe", "/c", "start", "", target], creationflags=subprocess.CREATE_NO_WINDOW)
@@ -302,29 +356,65 @@ def launch_browser(profile_dir: str = "", url: str = "") -> str:
     server uses: cookies set there are the cookies Claude browses with. Empty
     means the normal Chrome, which is what the Claude in Chrome extension drives.
     """
-    exe = shutil.which("chrome")
-    if not exe:
+    exe = next(
+        filter(None, map(shutil.which, ("chrome", "google-chrome", "google-chrome-stable", "chromium"))),
+        None,
+    )
+    if not exe and config.IS_WINDOWS:
         for candidate in CHROME_CANDIDATES:
             expanded = os.path.expandvars(candidate)
             if os.path.exists(expanded):
                 exe = expanded
                 break
     if not exe:
-        raise FileNotFoundError("Could not find chrome.exe — install Chrome or add it to PATH.")
+        raise FileNotFoundError("Could not find Chrome — install it or add it to PATH.")
 
     args = [exe]
     if profile_dir:
         args += [f"--user-data-dir={profile_dir}", "--no-first-run", "--no-default-browser-check"]
     if url:
         args.append(url)
-    subprocess.Popen(args, creationflags=subprocess.CREATE_NO_WINDOW)
+    subprocess.Popen(
+        args,
+        creationflags=config.NO_WINDOW,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     if profile_dir:
         return f"opened Chrome on the automation profile ({profile_dir})"
     return "opened your normal Chrome"
 
 
+def _x11_windows() -> list[tuple[object, str]]:
+    """(window, title) for every client the EWMH window manager lists."""
+    from Xlib import X, display
+
+    disp = display.Display()
+    root = disp.screen().root
+    net_list = disp.intern_atom("_NET_CLIENT_LIST")
+    net_name = disp.intern_atom("_NET_WM_NAME")
+    utf8 = disp.intern_atom("UTF8_STRING")
+    prop = root.get_full_property(net_list, X.AnyPropertyType)
+    found = []
+    for wid in prop.value if prop else []:
+        win = disp.create_resource_object("window", wid)
+        try:
+            name = win.get_full_property(net_name, utf8)
+            title = name.value if name else (win.get_wm_name() or "")
+        except Exception:  # windows can vanish mid-enumeration
+            continue
+        if isinstance(title, bytes):
+            title = title.decode("utf-8", "replace")
+        if title.strip():
+            found.append((win, title))
+    return found
+
+
 def list_windows() -> list[str]:
     """Titles of visible top-level windows."""
+    if not config.IS_WINDOWS:
+        return [title for _win, title in _x11_windows()]
     user32 = ctypes.windll.user32
     titles: list[str] = []
 
@@ -350,6 +440,8 @@ def list_windows() -> list[str]:
 
 def focus_window(needle: str) -> str:
     """Bring the first window whose title contains `needle` to the foreground."""
+    if not config.IS_WINDOWS:
+        return _x11_focus(needle)
     user32 = ctypes.windll.user32
     target = {"hwnd": None, "title": ""}
     lowered = needle.lower()
@@ -379,3 +471,23 @@ def focus_window(needle: str) -> str:
     user32.ShowWindow(target["hwnd"], 9)  # SW_RESTORE
     user32.SetForegroundWindow(target["hwnd"])
     return f"focused {target['title']!r}"
+
+
+def _x11_focus(needle: str) -> str:
+    from Xlib import X, protocol
+
+    lowered = needle.lower()
+    for win, title in _x11_windows():
+        if lowered not in title.lower():
+            continue
+        disp = win.display
+        root = disp.screen().root
+        event = protocol.event.ClientMessage(
+            window=win,
+            client_type=disp.intern_atom("_NET_ACTIVE_WINDOW"),
+            data=(32, [2, X.CurrentTime, 0, 0, 0]),  # 2 = request from a pager
+        )
+        root.send_event(event, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+        disp.flush()
+        return f"focused {title!r}"
+    return f"no visible window matching {needle!r}"

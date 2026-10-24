@@ -75,7 +75,7 @@ home directory. See [Configuration](#configuration) for the rest.
 python bot.py
 ```
 
-Or double-click `run.bat`. When it connects it DMs you "PC control online".
+Or double-click `run.bat`. When it connects the bot shows as online in Discord, and offline again once it stops.
 Leave the window open — closing it kills remote access.
 
 ### 6. Check it works
@@ -113,11 +113,29 @@ it:
 
 Everything is per-user under `HKCU` — no admin rights, nothing machine-wide.
 
+### Linux (X11)
+
+Everything except the PowerShell-specific bits ports over: `!sh` runs bash,
+`!cmd` runs sh, volume goes through `pactl`, power through `loginctl` /
+`systemctl` / `shutdown` (which only takes whole minutes). Needs an X11
+session, and `xclip` on PATH for `!clip`.
+
+```bash
+uv venv --python 3.12 --managed-python .venv   # managed Python ships tkinter for the HUD
+uv pip install --python .venv/bin/python -r requirements.txt python-xlib
+cp .env.example .env && $EDITOR .env
+./install-startup.sh        # systemd user service, starts with the desktop session
+journalctl --user -u claudle -f
+```
+
+`!relaunch` exits with status 75 under systemd and the unit restarts it; the
+tray's **Quit** exits cleanly and stays down.
+
 ### Troubleshooting
 
 | Symptom | Cause |
 |---|---|
-| Bot starts but never DMs you | You don't share a server with it. Redo step 2.4. |
+| Bot never shows online, or never replies to DMs | You don't share a server with it. Redo step 2.4. |
 | Bot ignores every message | `DISCORD_OWNER_ID` doesn't match your account, or you set it to your username instead of your numeric ID. |
 | Bot sees messages but they're empty | **MESSAGE CONTENT INTENT** is off. Step 2.3. |
 | `DISCORD_TOKEN is not set` on startup | No `.env`, or you edited `.env.example` instead of a copy named `.env`. |
@@ -499,4 +517,3 @@ Worth knowing:
 | `startup.pyw` | Console-less entry point for the startup shortcut; logs to `startup.log`. |
 | `install-startup.ps1` | Registers/removes the Task Manager startup entry. |
 | `.state/sessions.json` | Per-channel named conversations: session IDs, directories, model/effort. |
-| `.state/window.json` | Last-seen 5-hour window reset, so a restart doesn't re-announce it. |

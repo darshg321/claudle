@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-import time
 from datetime import datetime, timezone
 
 import config
@@ -54,20 +53,6 @@ def snapshot() -> dict:
     }
 
 
-def _load_state() -> dict:
-    try:
-        return json.loads(config.WINDOW_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _save_state(state: dict) -> None:
-    try:
-        config.WINDOW_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-
 def anchor(model: str | None = None) -> dict:
     """Open a new 5-hour window with the cheapest request that can do it.
 
@@ -75,8 +60,9 @@ def anchor(model: str | None = None) -> dict:
     `--no-session-persistence` keeps it out of the transcript history, so this
     leaves nothing behind for a later `--resume` to re-read.
     """
+    launcher = ["cmd.exe", "/c", "claude"] if config.IS_WINDOWS else ["claude"]
     argv = [
-        "cmd.exe", "/c", "claude",
+        *launcher,
         "-p",
         "--model", model or config.WINDOW_WARM_MODEL,
         "--effort", "low",
@@ -92,7 +78,7 @@ def anchor(model: str | None = None) -> dict:
         capture_output=True,
         timeout=180,
         env=config.clean_child_env(),
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=config.NO_WINDOW,
     )
     try:
         blob = json.loads(proc.stdout.decode("utf-8", "replace"))
@@ -126,14 +112,34 @@ def describe(state: dict) -> str:
 
 
 async def watch(notify) -> None:
-    """Poll until cancelled, calling `notify(text)` on every reset.
+    """Keep a window open forever, calling `notify(text)` on every reset.
 
     `notify` is an async callable taking one string.
+
+    This used to detect "the window rolled over" by comparing `resets_at`
+    across polls, tracked in a local state file so a restart wouldn't
+    re-announce. That local memory was the whole problem: on any hiccup —
+    a poll that failed to save, a stale file surviving a restart, the jitter
+    bug described above — the comparison silently stopped firing and the
+    window drifted or never re-anchored at all, with no error to show for
+    it, because there was nothing wrong to catch.
+
+    Anthropic's usage endpoint is the only source of truth for what window is
+    open and when it closes, so re-fetch it every cycle instead of trusting
+    memory of the last one. If a window is open, sleep until it is due to
+    close, then fire the anchor probe immediately so the next window opens at
+    that exact instant rather than whenever a real prompt happens to land. If
+    no window is open, anchor right away. Either way the next deadline comes
+    straight from that anchor's own `resets_at` — a fresh loop iteration reads
+    the same truth a freshly started bot would, so a restart mid-cycle costs
+    nothing.
+
+    `handled` guards against re-anchoring or re-notifying every poll while a
+    window stays closed (e.g. the anchor failed, or the endpoint hasn't yet
+    caught up to the probe that just opened one) — it only clears once a poll
+    actually observes an open window again.
     """
-    state = _load_state()
-    last_resets_at = state.get("resets_at")
-    last_resets_dt = _parse(last_resets_at)
-    announced = state.get("announced_at")
+    handled = False
 
     while True:
         try:
@@ -147,54 +153,36 @@ async def watch(notify) -> None:
             await asyncio.sleep(config.WINDOW_POLL_SECONDS)
             continue
 
-        current = now["resets_at"]
-        current_dt = now["resets_dt"]
         now_utc = datetime.now(timezone.utc)
 
-        # A window has only actually rolled over once the boundary we already
-        # knew about has passed. Comparing `resets_at` as a string here used to
-        # be the whole check, but Anthropic's usage endpoint recomputes it
-        # fresh on every call — two polls a moment apart can differ by tens of
-        # milliseconds with nothing having changed, which read as "a new
-        # window" and fired a false reset DM plus a real anchor probe.
-        rolled = (
-            last_resets_dt is not None
-            and last_resets_dt <= now_utc
-            and announced != last_resets_at
-        )
+        if now["open"] and now["resets_dt"] and now["resets_dt"] > now_utc:
+            handled = False
+            # Not due yet. Poll rather than sleeping the whole gap in one
+            # shot, so a suspended machine notices the boundary soon after it
+            # wakes instead of oversleeping indefinitely.
+            seconds_left = (now["resets_dt"] - now_utc).total_seconds()
+            await asyncio.sleep(min(seconds_left, config.WINDOW_POLL_SECONDS))
+            continue
 
-        if rolled:
-            announced = last_resets_at
-            lines = ["♻️ **Usage window reset.**"]
-            if now["open"]:
-                lines.append(describe(now))
-            else:
-                lines.append("The 5-hour window is empty — nothing is counting against it.")
+        if handled:
+            await asyncio.sleep(config.WINDOW_POLL_SECONDS)
+            continue
 
-            if config.WINDOW_WARM:
-                try:
-                    result = await asyncio.to_thread(anchor)
-                    fresh = await asyncio.to_thread(snapshot)
-                    lines.append(
-                        f"⚓ Anchored the next window with a {result['cache_write'] + result['cache_read'] + result['input']:,}-token "
-                        f"probe on `{config.WINDOW_WARM_MODEL}`."
-                    )
-                    lines.append(describe(fresh))
-                    current = fresh["resets_at"]
-                    current_dt = fresh["resets_dt"]
-                except Exception as exc:
-                    lines.append(f"⚠️ Could not anchor the new window: {exc}")
+        lines = ["♻️ **Usage window reset.**"]
+        if config.WINDOW_WARM:
+            try:
+                result = await asyncio.to_thread(anchor)
+                fresh = await asyncio.to_thread(snapshot)
+                lines.append(
+                    f"⚓ Anchored the next window with a {result['cache_write'] + result['cache_read'] + result['input']:,}-token "
+                    f"probe on `{config.WINDOW_WARM_MODEL}`."
+                )
+                lines.append(describe(fresh))
+            except Exception as exc:
+                lines.append(f"⚠️ Could not anchor the new window: {exc}")
+        else:
+            lines.append("The 5-hour window is empty — nothing is counting against it.")
 
-            await notify("\n".join(lines))
-
-        last_resets_at = current
-        last_resets_dt = current_dt
-        _save_state({"resets_at": current, "announced_at": announced})
-
-        # Poll harder as the reset approaches so the DM lands close to the event.
-        delay = config.WINDOW_POLL_SECONDS
-        if current_dt:
-            seconds = (current_dt - now_utc).total_seconds()
-            if 0 < seconds < 600:
-                delay = 30
-        await asyncio.sleep(delay)
+        handled = True
+        await notify("\n".join(lines))
+        await asyncio.sleep(config.WINDOW_POLL_SECONDS)

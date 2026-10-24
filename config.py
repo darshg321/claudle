@@ -1,9 +1,15 @@
 """Configuration loading for the PC control bot."""
 import json
 import os
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+IS_WINDOWS = os.name == "nt"
+
+# Popen flag that keeps a console window from flashing up on Windows; a no-op
+# elsewhere, so call sites can pass it unconditionally.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 STATE_DIR = ROOT / ".state"
 STATE_DIR.mkdir(exist_ok=True)
 
@@ -156,7 +162,6 @@ BARE_MESSAGE_IS_PROMPT = _bool("BARE_MESSAGE_IS_PROMPT", True)
 MAX_UPLOAD_BYTES = _int("MAX_UPLOAD_BYTES", 7_500_000)
 
 SESSION_FILE = STATE_DIR / "sessions.json"
-WINDOW_FILE = STATE_DIR / "window.json"
 
 # --------------------------------------------------------------- usage windows
 

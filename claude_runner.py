@@ -151,10 +151,10 @@ class ClaudeSession:
 
         async def attempt(resume: bool) -> RunResult:
             args = self._build_args(resume)
+            # npm installs `claude` as a .cmd shim on Windows, which only cmd.exe can run.
+            launcher = ["cmd.exe", "/c", exe] if config.IS_WINDOWS else [exe]
             proc = await asyncio.create_subprocess_exec(
-                "cmd.exe",
-                "/c",
-                exe,
+                *launcher,
                 *args,
                 cwd=self.cwd,
                 env=config.clean_child_env(),

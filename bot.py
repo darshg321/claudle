@@ -317,7 +317,10 @@ def human_duration(ms: int) -> str:
 
 
 async def run_shell(command_line: str, cwd: str, powershell: bool) -> tuple[int, str]:
-    if powershell:
+    # Off Windows, `powershell` picks the full login shell and the legacy one is plain sh.
+    if not config.IS_WINDOWS:
+        argv = ["bash", "-lc", command_line] if powershell else ["sh", "-c", command_line]
+    elif powershell:
         argv = [
             "powershell.exe",
             "-NoProfile",
@@ -336,7 +339,7 @@ async def run_shell(command_line: str, cwd: str, powershell: bool) -> tuple[int,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         stdin=asyncio.subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=config.NO_WINDOW,
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.SHELL_TIMEOUT)
@@ -881,7 +884,7 @@ async def _git(ctx: Ctx, *args: str) -> tuple[int, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         stdin=asyncio.subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=config.NO_WINDOW,
     )
     out, _ = await proc.communicate()
     return proc.returncode or 0, out.decode("utf-8", "replace")
@@ -954,6 +957,10 @@ async def cmd_commit(ctx: Ctx) -> None:
     await ctx.ok(f"Committed.\n```\n{out.strip()[:1500]}\n```")
 
 
+# Exit status that asks a systemd supervisor (claudle.service) to start us again.
+RELAUNCH_EXIT_CODE = 75
+
+
 @command(
     "relaunch",
     "!relaunch",
@@ -975,7 +982,7 @@ async def cmd_relaunch(ctx: Ctx) -> None:
         cwd=config.SELF_DIR,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=config.NO_WINDOW,
     )
     out, _ = await proc.communicate()
     if proc.returncode != 0:
@@ -987,35 +994,58 @@ async def cmd_relaunch(ctx: Ctx) -> None:
     save_sessions()
 
     # Detach the replacement so it survives this process exiting, then tear the
-    # tray down before quitting or the icon lingers as a ghost.
-    subprocess.Popen(
-        [sys.executable, str(entry)],
-        cwd=config.SELF_DIR,
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        close_fds=True,
-    )
+    # tray down before quitting or the icon lingers as a ghost. Under systemd a
+    # detached child would be killed along with the unit's cgroup, so there the
+    # service's Restart= brings the bot back instead.
+    if config.IS_WINDOWS:
+        subprocess.Popen(
+            [sys.executable, str(entry)],
+            cwd=config.SELF_DIR,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+    elif not os.environ.get("INVOCATION_ID"):
+        subprocess.Popen(
+            [sys.executable, str(entry)],
+            cwd=config.SELF_DIR,
+            start_new_session=True,
+            close_fds=True,
+        )
     await asyncio.sleep(1.0)
     UI.stop()
     await client.close()
-    os._exit(0)
+    # The systemd unit restarts on failure only, so the tray's Quit stays quit.
+    os._exit(RELAUNCH_EXIT_CODE if os.environ.get("INVOCATION_ID") else 0)
 
 
 # ----------------------------------------------------------------------------- shell
 
 
-@command("sh", "!sh <command>", "Run a PowerShell command.", "Shell", aliases=("ps", "pwsh"))
+@command(
+    "sh",
+    "!sh <command>",
+    "Run a PowerShell command." if config.IS_WINDOWS else "Run a bash command.",
+    "Shell",
+    aliases=("ps", "pwsh"),
+)
 async def cmd_sh(ctx: Ctx) -> None:
     if not ctx.rest:
         await ctx.fail("Give me a command.")
         return
     async with ctx.channel.typing():
         code, output = await run_shell(ctx.rest, ctx.state.cwd, powershell=True)
-    await ctx.long(output or "(no output)", lang="powershell", filename="shell.txt")
+    lang = "powershell" if config.IS_WINDOWS else "bash"
+    await ctx.long(output or "(no output)", lang=lang, filename="shell.txt")
     if code != 0:
         await ctx.send(f"_exit code {code}_")
 
 
-@command("cmd", "!cmd <command>", "Run a legacy cmd.exe command.", "Shell")
+@command(
+    "cmd",
+    "!cmd <command>",
+    "Run a legacy cmd.exe command." if config.IS_WINDOWS else "Run a plain sh command.",
+    "Shell",
+)
 async def cmd_cmd(ctx: Ctx) -> None:
     if not ctx.rest:
         await ctx.fail("Give me a command.")
@@ -1495,9 +1525,22 @@ async def cmd_help(ctx: Ctx) -> None:
 # ------------------------------------------------------------------------------ client
 
 
-intents = discord.Intents.default()
+# Only what on_message needs. Every other intent (typing, presence, reactions…)
+# is gateway traffic the bot would wake up to parse and then ignore.
+intents = discord.Intents.none()
+intents.guilds = True
+intents.guild_messages = True
+intents.dm_messages = True
 intents.message_content = True
-client = discord.Client(intents=intents)
+# Presence is the "is it up" signal: online while connected, offline once the
+# gateway closes — which is why SIGTERM is routed through a clean _shutdown.
+client = discord.Client(
+    intents=intents,
+    status=discord.Status.online,
+    max_messages=None,  # the bot never looks messages up, so don't cache 1000 of them
+    member_cache_flags=discord.MemberCacheFlags.none(),
+    chunk_guilds_at_startup=False,
+)
 
 
 @client.event
@@ -1516,18 +1559,21 @@ async def on_ready() -> None:
     )
     print(f"[pccontrol] autopilot (act without asking to confirm): {config.CLAUDE_AUTOPILOT}")
 
-    owner = None
-    try:
-        owner = await client.fetch_user(config.OWNER_ID)
-        await owner.send(
-            f"🟢 **PC control online** on `{os.environ.get('COMPUTERNAME', 'this PC')}`.\n"
-            f"Send a message to prompt Claude Code, or `{config.PREFIX}help` for commands."
-        )
-    except discord.HTTPException as exc:
-        print(f"[pccontrol] could not DM the owner: {exc}")
+    # systemctl stop, logout and poweroff all send SIGTERM. Dying on it would
+    # leave the bot showing online until Discord times the session out.
+    if not config.IS_WINDOWS:
+        import signal
+
+        LOOP.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(_shutdown()))
 
     # on_ready fires again on every reconnect; only ever run one watcher.
-    if config.WINDOW_WATCH and owner is not None and (WINDOW_TASK is None or WINDOW_TASK.done()):
+    if config.WINDOW_WATCH and (WINDOW_TASK is None or WINDOW_TASK.done()):
+        try:
+            owner = await client.fetch_user(config.OWNER_ID)
+        except discord.HTTPException as exc:
+            print(f"[pccontrol] could not fetch the owner for window DMs: {exc}")
+            return
+
         async def notify(text: str) -> None:
             try:
                 await owner.send(text)

@@ -3,14 +3,17 @@
 The bot must never run invisibly, so `DesktopUI.start` raises if the tray
 cannot be shown and the caller is expected to abort.
 
-Threading: pystray and tkinter each need their own thread with their own
-message loop, and neither is safe to touch from outside its thread. The bot
-pushes work in through queues, and the UI calls back out through plain
-callables that the bot marshals onto the asyncio loop.
+Threading: pystray needs its own thread with its own message loop and is not
+safe to touch from outside it; the HUD is a separate process fed over a pipe.
+The UI calls back out through plain callables that the bot marshals onto the
+asyncio loop.
 """
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
+import sys
 import threading
 from typing import Callable
 
@@ -113,96 +116,153 @@ class _Tray:
 
 
 class _Hud:
-    """Small always-on-top panel in the bottom-right corner, shown while busy."""
+    """Small always-on-top panel in the bottom-right corner, shown while busy.
 
-    WIDTH = 340
-    HEIGHT = 112
-    MARGIN = 24
-    TASKBAR = 56
+    The panel is its own short-lived process (`python ui.py --hud`), started
+    when a task begins and ended when it finishes, so an idle bot holds no Tk
+    interpreter and runs no polling loop. Tk cannot be safely torn down and
+    rebuilt inside one process across threads, and a separate process also
+    means a Tk crash can never take the bot with it.
+
+    Protocol: the bot writes `kind\tpayload` lines to the child's stdin; the
+    child prints `kill` when its button is pressed and exits at stdin EOF.
+    """
 
     def __init__(self, on_kill: Callable[[], None]):
         self._on_kill = on_kill
-        self._q: queue.Queue[tuple[str, str]] = queue.Queue()
-        self._thread: threading.Thread | None = None
-        self._root = None
-        self._title = None
-        self._body = None
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="claudle-hud", daemon=True)
-        self._thread.start()
+        """Nothing to do until the first task; kept so DesktopUI reads the same."""
 
-    def _run(self) -> None:
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        root.overrideredirect(True)
-        root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.96)
-        root.configure(bg=BG)
-
-        frame = tk.Frame(root, bg=BG, padx=12, pady=10, highlightthickness=1)
-        frame.configure(highlightbackground="#3f4147", highlightcolor="#3f4147")
-        frame.pack(fill="both", expand=True)
-
-        self._title = tk.Label(
-            frame, text=f"{APP_NAME} — working", bg=BG, fg=FG,
-            font=("Segoe UI", 9, "bold"), anchor="w",
+    def _spawn(self) -> subprocess.Popen:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--hud"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        self._title.pack(fill="x")
 
-        self._body = tk.Label(
-            frame, text="starting…", bg=BG, fg=MUTED, font=("Segoe UI", 8),
-            anchor="w", justify="left", wraplength=self.WIDTH - 40,
-        )
-        self._body.pack(fill="x", pady=(4, 8))
+        def listen() -> None:
+            for line in proc.stdout:
+                if line.strip() == "kill":
+                    self._on_kill()
 
-        tk.Button(
-            frame, text="Kill", command=self._on_kill, bg=DANGER, fg="white",
-            activebackground="#a12828", activeforeground="white",
-            relief="flat", font=("Segoe UI", 8, "bold"), padx=14, pady=2,
-            cursor="hand2", borderwidth=0,
-        ).pack(anchor="e")
+        threading.Thread(target=listen, name="claudle-hud", daemon=True).start()
+        return proc
 
-        self._root = root
-        self._pump()
-        root.mainloop()
+    def send(self, kind: str, payload: str = "") -> None:
+        with self._lock:
+            proc = self._proc
+            if kind in ("hide", "stop"):
+                self._proc = None
+                if proc is not None:
+                    try:
+                        proc.stdin.close()  # EOF: the panel closes itself
+                    except OSError:
+                        pass
+                return
+            if proc is None or proc.poll() is not None:
+                if kind != "show":
+                    return  # no panel up: an update has nothing to act on
+                proc = self._proc = self._spawn()
+            try:
+                proc.stdin.write(f"{kind}\t{' '.join(payload.split())}\n")
+                proc.stdin.flush()
+            except OSError:
+                self._proc = None
 
-    def _place(self) -> None:
-        screen_w = self._root.winfo_screenwidth()
-        screen_h = self._root.winfo_screenheight()
-        x = screen_w - self.WIDTH - self.MARGIN
-        y = screen_h - self.HEIGHT - self.TASKBAR
-        self._root.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
 
-    def _pump(self) -> None:
+def _hud_main() -> None:
+    """Entry point of the panel process. See _Hud."""
+    import tkinter as tk
+
+    width, height, margin, taskbar = 340, 112, 24, 56
+    inbox: queue.Queue[tuple[str, str]] = queue.Queue()
+
+    def read_stdin() -> None:
+        for line in sys.stdin:
+            kind, _, payload = line.rstrip("\n").partition("\t")
+            inbox.put((kind, payload))
+        inbox.put(("stop", ""))
+
+    threading.Thread(target=read_stdin, daemon=True).start()
+
+    # Tk's screen size spans every monitor on X11, which would put the panel
+    # on whichever display sits furthest right. Anchor to the primary instead.
+    try:
+        import screen
+
+        mon = screen.primary_monitor()
+        primary = (mon["left"], mon["top"], mon["width"], mon["height"])
+    except Exception:
+        primary = None
+
+    root = tk.Tk()
+    root.withdraw()
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 0.96)
+    root.configure(bg=BG)
+
+    frame = tk.Frame(root, bg=BG, padx=12, pady=10, highlightthickness=1)
+    frame.configure(highlightbackground="#3f4147", highlightcolor="#3f4147")
+    frame.pack(fill="both", expand=True)
+
+    title = tk.Label(
+        frame, text=f"{APP_NAME} — working", bg=BG, fg=FG,
+        font=("Segoe UI", 9, "bold"), anchor="w",
+    )
+    title.pack(fill="x")
+
+    body = tk.Label(
+        frame, text="starting…", bg=BG, fg=MUTED, font=("Segoe UI", 8),
+        anchor="w", justify="left", wraplength=width - 40,
+    )
+    body.pack(fill="x", pady=(4, 8))
+
+    def kill() -> None:
+        print("kill", flush=True)
+
+    tk.Button(
+        frame, text="Kill", command=kill, bg=DANGER, fg="white",
+        activebackground="#a12828", activeforeground="white",
+        relief="flat", font=("Segoe UI", 8, "bold"), padx=14, pady=2,
+        cursor="hand2", borderwidth=0,
+    ).pack(anchor="e")
+
+    if primary is None:
+        primary = (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+
+    def pump() -> None:
         try:
             while True:
-                kind, payload = self._q.get_nowait()
+                kind, payload = inbox.get_nowait()
                 if kind == "show":
-                    self._title.configure(text=payload)
-                    self._body.configure(text="starting…")
-                    self._place()
-                    self._root.deiconify()
-                    self._root.attributes("-topmost", True)
+                    title.configure(text=payload)
+                    body.configure(text="starting…")
+                    left, top, screen_w, screen_h = primary
+                    x = left + screen_w - width - margin
+                    y = top + screen_h - height - taskbar
+                    root.geometry(f"{width}x{height}+{x}+{y}")
+                    root.deiconify()
+                    root.attributes("-topmost", True)
                 elif kind == "title":
-                    self._title.configure(text=payload)
+                    title.configure(text=payload)
                 elif kind == "update":
-                    self._body.configure(text=payload)
-                elif kind == "hide":
-                    self._root.withdraw()
+                    body.configure(text=payload)
                 elif kind == "stop":
-                    self._root.destroy()
+                    root.destroy()
                     return
         except queue.Empty:
             pass
-        except Exception:
-            pass
-        self._root.after(120, self._pump)
+        root.after(120, pump)
 
-    def send(self, kind: str, payload: str = "") -> None:
-        self._q.put((kind, payload))
+    pump()
+    root.mainloop()
 
 
 class DesktopUI:
@@ -242,3 +302,7 @@ class DesktopUI:
         if self._tray:
             self._tray.stop()
             self._tray = None
+
+
+if __name__ == "__main__" and "--hud" in sys.argv:
+    _hud_main()

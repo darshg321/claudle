@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 startup.log
 startup.log.old
+.venv/

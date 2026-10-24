@@ -144,7 +144,7 @@ def webcam(index: int = 0, warmup_frames: int = 8) -> tuple[bytes, str]:
     """Grab a still from a webcam."""
     import cv2
 
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if config.IS_WINDOWS else cv2.CAP_ANY)
     try:
         if not cap.isOpened():
             raise RuntimeError(f"could not open camera {index}")
