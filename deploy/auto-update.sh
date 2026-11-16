@@ -10,7 +10,7 @@ BRANCH="${CLAUDLE_BRANCH:-main}"
 # setpriv instead of runuser/sudo: no PAM session, so no journal noise every minute.
 g() { HOME="/home/$OWNER" setpriv --reuid="$OWNER" --regid="$OWNER" --init-groups git -C "$DIR" "$@"; }
 
-g fetch --quiet origin "$BRANCH"
+g fetch --quiet origin "$BRANCH" || { echo "fetch failed (offline?), will retry"; exit 0; }
 OLD=$(g rev-parse HEAD)
 NEW=$(g rev-parse "origin/$BRANCH")
 [[ "$OLD" == "$NEW" ]] && exit 0
