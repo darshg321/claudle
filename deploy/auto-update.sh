@@ -7,7 +7,8 @@ set -euo pipefail
 DIR=/home/dash/claudle
 OWNER=dash
 BRANCH="${CLAUDLE_BRANCH:-main}"
-g() { runuser -u "$OWNER" -- git -C "$DIR" "$@"; }
+# setpriv instead of runuser/sudo: no PAM session, so no journal noise every minute.
+g() { HOME="/home/$OWNER" setpriv --reuid="$OWNER" --regid="$OWNER" --init-groups git -C "$DIR" "$@"; }
 
 g fetch --quiet origin "$BRANCH"
 OLD=$(g rev-parse HEAD)
