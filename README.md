@@ -131,6 +131,25 @@ journalctl --user -u claudle -f
 `!relaunch` exits with status 75 under systemd and the unit restarts it; the
 tray's **Quit** exits cleanly and stays down.
 
+### Raspberry Pi (headless, always on, auto-updates)
+
+Runs as a system service (no tray, no screenshots) that restarts on any exit and
+pulls new commits from GitHub every minute:
+
+```bash
+git clone https://github.com/darshg321/claudle ~/claudle && cd ~/claudle
+cp .env.example .env && $EDITOR .env     # HEADLESS=true, AUTO_SCREENSHOT=false
+sudo ./deploy/install-pi.sh
+journalctl -u claudle -f                  # bot log
+journalctl -u claudle-update -f           # deploy log
+```
+
+On each new commit on `main` it resets to it, reinstalls requirements if they
+changed, restarts, and checks the bot is still up 30s later. If not, it rolls
+back and skips that commit. Pushing restarts the bot, so a running prompt is cut off.
+
+Only run Claudle on one machine at a time: every copy with the same token answers your DMs.
+
 ### Troubleshooting
 
 | Symptom | Cause |

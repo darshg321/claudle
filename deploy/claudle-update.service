@@ -1,0 +1,9 @@
+[Unit]
+Description=Claudle: pull from git and restart if changed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/dash/claudle/deploy/auto-update.sh
+TimeoutStartSec=15min

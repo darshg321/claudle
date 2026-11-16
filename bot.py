@@ -1682,16 +1682,21 @@ def main() -> None:
         print(f"Warning: {exc}\nEverything except Claude commands will still work.\n")
 
     # The bot is remote code execution on this machine; it must never run
-    # without a visible way to see and stop it. No tray, no bot.
-    try:
-        UI.start(
-            on_quit=lambda: _from_ui(_shutdown),
-            on_kill=lambda: _from_ui(lambda: _kill_active("the desktop")),
-        )
-    except ui.TrayUnavailable as exc:
-        print(f"Refusing to start without a tray icon: {exc}")
-        print("Install the tray dependency with: python -m pip install -r requirements.txt")
-        sys.exit(1)
+    # without a visible way to see and stop it. No tray, no bot, unless
+    # HEADLESS=true was set explicitly for a server managed by systemd.
+    if config.HEADLESS:
+        print("HEADLESS=true: running without tray icon or HUD.")
+    else:
+        try:
+            UI.start(
+                on_quit=lambda: _from_ui(_shutdown),
+                on_kill=lambda: _from_ui(lambda: _kill_active("the desktop")),
+            )
+        except ui.TrayUnavailable as exc:
+            print(f"Refusing to start without a tray icon: {exc}")
+            print("Install the tray dependency with: python -m pip install -r requirements.txt")
+            print("On a headless server, set HEADLESS=true in .env.")
+            sys.exit(1)
 
     try:
         client.run(config.TOKEN, log_handler=None)

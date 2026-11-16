@@ -155,7 +155,11 @@ _mcp = os.environ.get("MCP_CONFIG", "").strip() or str(ROOT / "mcp.json")
 MCP_CONFIG = _mcp if Path(_mcp).is_file() else ""
 
 SHELL_TIMEOUT = _int("SHELL_TIMEOUT", 180)
-AUTO_SCREENSHOT = _bool("AUTO_SCREENSHOT", True)
+# Headless servers (e.g. a Raspberry Pi under systemd): run without the tray
+# icon and HUD. Off by default, so a desktop install still refuses to run
+# without a visible way to stop it.
+HEADLESS = _bool("HEADLESS", False)
+AUTO_SCREENSHOT = _bool("AUTO_SCREENSHOT", not HEADLESS)
 BARE_MESSAGE_IS_PROMPT = _bool("BARE_MESSAGE_IS_PROMPT", True)
 
 # Discord free-tier upload ceiling is 10 MiB; stay comfortably under it.

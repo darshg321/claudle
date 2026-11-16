@@ -1,0 +1,24 @@
+[Unit]
+Description=Claudle Discord bot (headless, always on)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=dash
+WorkingDirectory=/home/dash/claudle
+Environment=HOME=/home/dash
+Environment=PATH=/home/dash/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+ExecStart=/home/dash/claudle/.venv/bin/python /home/dash/claudle/bot.py
+# Always on: come back after crashes, Discord disconnects, !relaunch, everything.
+Restart=always
+RestartSec=5
+# Stop only the bot; child `claude` processes get time to exit cleanly.
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
