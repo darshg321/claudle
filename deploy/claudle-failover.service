@@ -1,0 +1,9 @@
+[Unit]
+Description=Claudle failover: run the bot on the Pi only while the laptops are offline
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/claudle-failover.env
+ExecStart=/home/dash/claudle/deploy/failover.sh

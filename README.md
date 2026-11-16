@@ -131,22 +131,27 @@ journalctl --user -u claudle -f
 `!relaunch` exits with status 75 under systemd and the unit restarts it; the
 tray's **Quit** exits cleanly and stays down.
 
-### Raspberry Pi (headless, always on, auto-updates)
+### Raspberry Pi (headless failover, auto-updates)
 
-Runs as a system service (no tray, no screenshots) that restarts on any exit and
-pulls new commits from GitHub every minute:
+The laptops stay the main hosts. The Pi runs the bot only while none of them is reachable
+over Tailscale, so it takes over when you close the lid and steps back when you return:
 
 ```bash
 git clone https://github.com/darshg321/claudle ~/claudle && cd ~/claudle
 cp .env.example .env && $EDITOR .env     # HEADLESS=true, AUTO_SCREENSHOT=false
 sudo ./deploy/install-pi.sh
-journalctl -u claudle -f                  # bot log
-journalctl -u claudle-update -f           # deploy log
+journalctl -u claudle-failover -f         # takeover / hand-back decisions
+journalctl -u claudle -f                  # bot log while the Pi has it
 ```
 
-On each new commit on `main` it resets to it, reinstalls requirements if they
-changed, restarts, and checks the bot is still up 30s later. If not, it rolls
-back and skips that commit. Pushing restarts the bot, so a running prompt is cut off.
+`claudle-failover.timer` checks every 30 s (Tailscale online + `tailscale ping`). After two checks
+with every laptop unreachable it starts the bot; as soon as one laptop answers it stops it. Laptop
+names are `pop-os` and `ds-laptop`; override with `LAPTOPS="…"` in `/etc/claudle-failover.env`.
+When a laptop comes back, its own copy and the Pi's can overlap for up to ~30 s.
+
+`claudle-update.timer` pulls `main` every minute. New commits are installed; if the bot is running
+on the Pi it is restarted and checked 30 s later, with rollback to the previous commit if it didn't
+stay up. A push restarts a running Pi bot, which cuts off a prompt in progress.
 
 Only run Claudle on one machine at a time: every copy with the same token answers your DMs.
 

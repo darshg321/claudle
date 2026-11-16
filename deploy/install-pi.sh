@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Installs Claudle as an always-on headless systemd service on a Raspberry Pi,
-# plus a timer that pulls from git every minute and restarts on new commits.
+# Installs Claudle on a Raspberry Pi as a headless *failover* host: the bot runs here only
+# while none of the laptops is reachable over Tailscale (claudle-failover.timer), and a
+# second timer pulls from git every minute and redeploys on new commits.
 #
 #   git clone https://github.com/darshg321/claudle ~/claudle
 #   cp .env.example .env && $EDITOR .env      # set HEADLESS=true
@@ -27,9 +28,13 @@ fi
 [[ -f "$DIR/.env" ]] || echo "warning: $DIR/.env missing; copy .env.example and fill it in" >&2
 
 install -m 644 "$DIR/deploy/claudle.service" "$DIR/deploy/claudle-update.service" \
-  "$DIR/deploy/claudle-update.timer" /etc/systemd/system/
+  "$DIR/deploy/claudle-update.timer" "$DIR/deploy/claudle-failover.service" \
+  "$DIR/deploy/claudle-failover.timer" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable claudle claudle-update.timer >/dev/null
-systemctl start claudle-update.timer
-[[ "${1:-}" == "--no-restart" ]] || systemctl restart claudle
-echo "claudle installed: journalctl -u claudle -f"
+# The failover timer decides when the bot runs, so it is not started at boot by itself.
+systemctl disable claudle >/dev/null 2>&1 || true
+systemctl enable --now claudle-update.timer claudle-failover.timer >/dev/null
+if [[ "${1:-}" != "--no-restart" ]] && systemctl is-active --quiet claudle; then
+  systemctl restart claudle
+fi
+echo "claudle installed (failover). Bot log: journalctl -u claudle -f · failover: journalctl -u claudle-failover"

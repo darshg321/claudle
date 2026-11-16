@@ -21,6 +21,8 @@ echo "update $OLD -> $NEW: $(g log -1 --format=%s "$NEW")"
 deploy() {
   g reset --hard --quiet "$1"
   "$DIR/deploy/install-pi.sh" --no-restart
+  # Failover host: if the bot isn't running here (a laptop has it), installing is enough.
+  systemctl is-active --quiet claudle || return 0
   systemctl restart claudle
   local before; before=$(systemctl show -p NRestarts --value claudle)
   # Healthy = still running, without crash-restarts, after 30s.
