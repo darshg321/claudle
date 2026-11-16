@@ -20,7 +20,8 @@ import json, sys
 host = sys.argv[1]
 peers = json.load(sys.stdin).get("Peer", {}).values()
 sys.exit(0 if any(p.get("HostName") == host and p.get("Online") for p in peers) else 1)' "$host" || return 1
-  timeout 8 tailscale ping -c 1 --timeout 5s "$host" >/dev/null 2>&1
+  # Up to 3 tries: the first ping after a quiet period can be lost while the path is set up.
+  timeout 12 tailscale ping -c 3 --timeout 3s "$host" >/dev/null 2>&1
 }
 
 if ! tailscale status >/dev/null 2>&1; then
